@@ -48,6 +48,16 @@ impl RuntimeOrHandle {
 #[derive(Clone)]
 pub struct ThreadPool {
     inner: rusty_pool::ThreadPool,
+    max_threads: usize,
+}
+
+impl ThreadPool {
+    /// Every worker exists and is busy, so new work would only queue. Guest
+    /// workers can block on each other (a reader waiting for a queued writer),
+    /// so queuing a new guest there can hang the whole sandbox.
+    fn saturated(&self) -> bool {
+        self.get_current_worker_count() >= self.max_threads && self.get_idle_worker_count() == 0
+    }
 }
 
 impl std::ops::Deref for ThreadPool {
@@ -105,6 +115,7 @@ impl TokioTaskManager {
                     .core_size(core_threads)
                     .max_size(max_threads)
                     .build(),
+                max_threads,
             }),
         }
     }
@@ -257,6 +268,9 @@ impl VirtualTaskManager for TokioTaskManager {
         } else {
             tracing::trace!("spawning task_wasm in blocking thread");
 
+            if self.pool.saturated() {
+                return Err(WasiThreadError::WorkersExhausted);
+            }
             // Run the callback on a dedicated thread
             self.pool.execute(move || {
                 tracing::trace!("task_wasm started in blocking thread");

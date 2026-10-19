@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -86,7 +86,8 @@ struct MutableState {
     processes: HashMap<WasiProcessId, WasiProcess>,
     groups: HashMap<WasiProcessId, ProcessGroupInfo>,
     foreground_group: Option<u32>,
-    groups_enabled: bool,
+    /// Set under any lock mode, so read-only queries never need the write lock.
+    groups_enabled: AtomicBool,
     // TODO: keep a queue of terminated process ids for id reuse.
 }
 
@@ -126,7 +127,7 @@ impl WasiControlPlane {
                     processes: Default::default(),
                     groups: Default::default(),
                     foreground_group: None,
-                    groups_enabled: false,
+                    groups_enabled: AtomicBool::new(false),
                 }),
             }),
         }
@@ -311,8 +312,8 @@ impl WasiControlPlane {
     }
 
     pub fn process_group(&self, pid: WasiProcessId) -> Result<u32, Errno> {
-        let mut state = self.state.mutable.write().unwrap();
-        state.groups_enabled = true;
+        let state = self.state.mutable.read().unwrap();
+        state.groups_enabled.store(true, Ordering::Release);
         state.groups.get(&pid).map(|g| g.group).ok_or(Errno::Srch)
     }
 
@@ -342,7 +343,7 @@ impl WasiControlPlane {
             return Err(Errno::Perm);
         }
         state.groups.get_mut(&pid).unwrap().group = group;
-        state.groups_enabled = true;
+        state.groups_enabled.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -366,7 +367,7 @@ impl WasiControlPlane {
             return Err(Errno::Perm);
         }
         state.foreground_group = Some(group);
-        state.groups_enabled = true;
+        state.groups_enabled.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -376,31 +377,39 @@ impl WasiControlPlane {
         target: i32,
         signal: Signal,
     ) -> Result<(), Errno> {
-        let targets = {
+        if target == -1 || target == i32::MIN {
+            return Err(Errno::Notsup);
+        }
+        let group = if target == 0 {
             let state = self.state.mutable.read().unwrap();
-            if target == -1 || target == i32::MIN {
-                return Err(Errno::Notsup);
-            }
-            let group = if target == 0 {
-                Some(state.groups.get(&caller).ok_or(Errno::Srch)?.group)
-            } else if target < -1 {
-                Some((-target) as u32)
-            } else {
-                None
-            };
+            Some(state.groups.get(&caller).ok_or(Errno::Srch)?.group)
+        } else if target < -1 {
+            Some((-target) as u32)
+        } else {
+            None
+        };
+        self.signal_selected(group, target as u32, signal)
+    }
+
+    /// Signals process group `group`, or process `pid` when `group` is None.
+    fn signal_selected(&self, group: Option<u32>, pid: u32, signal: Signal) -> Result<(), Errno> {
+        let candidates = {
+            let state = self.state.mutable.read().unwrap();
             state
                 .processes
                 .iter()
-                .filter(|(pid, process)| {
-                    (process.try_join().is_none() || process.has_active_execution())
-                        && match group {
-                            Some(group) => state.groups.get(pid).is_some_and(|g| g.group == group),
-                            None => pid.raw() == target as u32,
-                        }
+                .filter(|(id, _)| match group {
+                    Some(group) => state.groups.get(id).is_some_and(|g| g.group == group),
+                    None => id.raw() == pid,
                 })
                 .map(|(_, process)| process.clone())
                 .collect::<Vec<_>>()
         };
+        // Process state takes each process lock: only after releasing ours.
+        let targets = candidates
+            .into_iter()
+            .filter(|process| process.try_join().is_none() || process.has_active_execution())
+            .collect::<Vec<_>>();
         if targets.is_empty() {
             return Err(Errno::Srch);
         }
@@ -416,13 +425,16 @@ impl WasiControlPlane {
     pub fn signal_foreground(&self, signal: Signal) -> bool {
         let group = {
             let state = self.state.mutable.read().unwrap();
-            if !state.groups_enabled {
+            if !state.groups_enabled.load(Ordering::Acquire) {
                 return false;
             }
             state.foreground_group
         };
-        if let Some(group) = group {
-            let _ = self.signal_process_target(0u32.into(), -(group as i32), signal);
+        // Group 1 is the root shell itself. A shell linked against the release
+        // libc cannot catch SIGINT, so delivering it would kill the shell; the
+        // terminal signal is consumed instead until the guest can opt in.
+        if let Some(group) = group.filter(|group| *group != 1) {
+            let _ = self.signal_selected(Some(group), 0, signal);
         }
         true
     }
@@ -615,6 +627,24 @@ mod tests {
             vec![Signal::Sigterm]
         );
         assert!(other_thread.as_thread().pop_signals().is_empty());
+    }
+
+    #[test]
+    fn test_foreground_signal_to_the_root_shell_group_is_consumed() {
+        let plane = WasiControlPlane::default();
+        let shell = plane.new_process(ModuleHash::random()).unwrap();
+        assert_eq!(shell.pid().raw(), 1);
+        let s = shell
+            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
+            .unwrap();
+        plane.set_foreground_group(shell.pid(), 1).unwrap();
+        assert_eq!(
+            plane.signal_process_target(shell.pid(), -1, Signal::Sigint),
+            Err(Errno::Notsup)
+        );
+        // Consumed, not delivered: a release-libc shell would die of it.
+        assert!(plane.signal_foreground(Signal::Sigint));
+        assert!(s.as_thread().pop_signals().is_empty());
     }
 
     #[test]

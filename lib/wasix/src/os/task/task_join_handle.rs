@@ -204,7 +204,9 @@ impl TaskJoinHandle {
             }
         });
 
-        #[cfg(unix)]
+        // Only the host-interrupt build can stop and continue a guest. Without
+        // it, leave SIGTSTP alone so Ctrl-Z suspends the host as upstream does.
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
         {
             let signal_handler = self.signal_handler.clone();
             if let Ok(mut stops) = tokio::signal::unix::signal(

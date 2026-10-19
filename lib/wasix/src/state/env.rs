@@ -1384,7 +1384,9 @@ impl WasiEnv {
                     // Otherwise a pending Sigquit can win the status race and
                     // make waiters observe a successful exit.
                     process.terminate(process_exit_code);
-                    process.signal_process(Signal::Sigquit);
+                    // Quit this process's remaining threads. Forwarding (signal_process)
+                    // would hit its children instead whenever a parent is waiting on it.
+                    process.signal_process_only(Signal::Sigquit);
                 }
             })
         } else {

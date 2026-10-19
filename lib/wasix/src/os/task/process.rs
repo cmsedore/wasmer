@@ -67,6 +67,17 @@ impl AsyncExecution {
     ) -> std::task::Poll<Result<(), ExitCode>> {
         self.0.poll_permitted(cx)
     }
+
+    /// Lets SIGKILL trap this lease's Store while its guest code runs on the
+    /// shared executor; without it a CPU loop could never be killed.
+    pub fn set_interrupter(&self, interrupter: wasmer::Interrupter) {
+        self.0.set_interrupter(interrupter)
+    }
+
+    /// The exit code a kill selected, once the process has been cancelled.
+    pub fn cancellation_code(&self) -> Option<ExitCode> {
+        self.0.cancellation_code()
+    }
 }
 
 #[cfg(all(unix, feature = "experimental-host-interrupt"))]
@@ -524,6 +535,10 @@ impl WasiProcess {
                             .upgrade()
                             .is_some_and(|p| p.signal_foreground(signal))
                     {
+                        return Ok(());
+                    }
+                    if signal == Signal::Sigtstp {
+                        // No guest job control: nothing could send SIGCONT afterwards.
                         return Ok(());
                     }
                     signal_process_internal(&self.0, signal, true);
@@ -1003,16 +1018,18 @@ impl WasiProcess {
     /// Stop native execution before publishing signal termination to waiters.
     pub(crate) fn terminate_for_signal(&self, signal: Signal) -> ExitCode {
         let code = ExitCode::from(128 + signal as i32);
-        let mut inner = self.inner.0.lock().unwrap();
         #[cfg(all(unix, feature = "experimental-host-interrupt"))]
         let code = {
-            inner.execution.cancel_with_code(code);
-            let selected = inner.execution.cancellation_code();
-            if selected == code {
-                inner.termination_signal.get_or_insert(signal);
-            }
-            selected
+            // Cancelling can publish the exit and lock the parent: not under our lock.
+            let execution = self.inner.0.lock().unwrap().execution.clone();
+            execution.cancel_with_code(code);
+            execution.cancellation_code()
         };
+        let mut inner = self.inner.0.lock().unwrap();
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        if code == ExitCode::from(128 + signal as i32) {
+            inner.termination_signal.get_or_insert(signal);
+        }
         #[cfg(not(all(unix, feature = "experimental-host-interrupt")))]
         {
             inner.termination_signal.get_or_insert(signal);
@@ -1039,6 +1056,12 @@ impl WasiProcess {
             exit_code
         };
         for thread in guard.threads.values() {
+            // The main thread's status is the process exit; a cancelled process
+            // publishes it only after every Store returned (finish_cancelled).
+            #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+            if cancelled && thread.is_main() {
+                continue;
+            }
             thread.set_status_finished(Ok(exit_code))
         }
         drop(guard);
@@ -1084,34 +1107,50 @@ fn signal_process_internal(
         };
     }
 
+    // Lock order is control plane, then one process. Signalling a child,
+    // cancelling, or reporting a stop can lock a parent through the control
+    // plane, so none of them may run while this process's lock is held.
+
     // Check if there are subprocesses that will receive this signal
     // instead of this process
-    if forward_children && guard.waiting.load(Ordering::Acquire) > 0 {
-        let mut triggered = false;
-        for child in guard.children.iter() {
+    if forward_children && guard.waiting.load(Ordering::Acquire) > 0 && !guard.children.is_empty() {
+        let children = guard.children.clone();
+        drop(guard);
+        for child in children {
             child.signal_process(signal);
-            triggered = true;
         }
-        if triggered {
-            return;
-        }
+        return;
     }
 
     // SIGKILL cannot depend on the guest reaching another syscall. Request a
     // per-process Store trap, including every currently active guest thread.
     #[cfg(all(unix, feature = "experimental-host-interrupt"))]
-    if signal == Signal::Sigkill {
-        guard.execution.cancel();
-    }
+    let mut guard = if signal == Signal::Sigkill {
+        let execution = guard.execution.clone();
+        if !execution.is_cancelled() && !execution.is_finished() {
+            // Waiters must see WIFSIGNALED(SIGKILL), not exit status 137.
+            guard.termination_signal.get_or_insert(Signal::Sigkill);
+        }
+        drop(guard);
+        execution.cancel();
+        process.0.lock().unwrap()
+    } else {
+        guard
+    };
 
     #[cfg(all(unix, feature = "experimental-host-interrupt"))]
     if matches!(
         signal,
         Signal::Sigstop | Signal::Sigtstp | Signal::Sigttin | Signal::Sigttou
     ) {
-        guard.execution.stop(signal);
+        let execution = guard.execution.clone();
+        let stopped = execution.stop(signal);
         for thread in guard.threads.values() {
             thread.signal(Signal::Sigwakeup);
+        }
+        drop(guard);
+        if stopped {
+            execution.notify_parent();
         }
         return;
     }

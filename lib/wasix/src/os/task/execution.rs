@@ -56,11 +56,16 @@ impl std::fmt::Debug for ProcessExecution {
 
 impl ProcessExecution {
     fn all_execution_parked(state: &State) -> bool {
-        !state.active.is_empty()
-            && state
-                .active
-                .keys()
-                .all(|id| state.parked.contains(id) || state.quiescent.contains(id))
+        state
+            .active
+            .keys()
+            .all(|id| state.parked.contains(id) || state.quiescent.contains(id))
+    }
+
+    /// Async leases share one executor thread with other processes, so this
+    /// process must never block that thread; its leases park at `poll_async`.
+    fn has_async_lease(state: &State) -> bool {
+        state.active.values().any(|store| store.worker.is_none())
     }
 
     pub(crate) fn new(pid: WasiProcessId) -> Self {
@@ -115,7 +120,7 @@ impl ProcessExecution {
         interrupter: Interrupter,
     ) -> Option<NativeExecutionGuard> {
         let mut state = self.state.lock().unwrap();
-        while state.stopped.is_some() && !state.cancelled {
+        while state.stopped.is_some() && !state.cancelled && !Self::has_async_lease(&state) {
             state = self.resumed.wait(state).unwrap();
         }
         if state.cancelled {
@@ -206,20 +211,33 @@ impl ProcessExecution {
         if let Some(finished) = &self.finished {
             finished.set_finished(Ok(self.cancellation_code()));
         }
+        self.notify_parent();
+    }
+
+    /// Takes the control-plane and parent locks: never call with a process lock held.
+    pub(crate) fn notify_parent(&self) {
         if let Some(plane) = self.control_plane.as_ref().and_then(|p| p.upgrade()) {
             plane.notify_parent_child_event(self.pid);
         }
     }
 
-    pub(crate) fn cancel(self: &Arc<Self>) {
-        self.cancel_with_code(137i32.into());
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished
+            .as_ref()
+            .is_some_and(|finished| finished.status().is_finished())
     }
 
-    pub(crate) fn cancel_with_code(self: &Arc<Self>, code: ExitCode) {
+    /// Returns true when this call cancelled the process. May publish the exit
+    /// and notify the parent: never call with a process lock held.
+    pub(crate) fn cancel(self: &Arc<Self>) -> bool {
+        self.cancel_with_code(137i32.into())
+    }
+
+    pub(crate) fn cancel_with_code(self: &Arc<Self>, code: ExitCode) -> bool {
         let (acknowledged, waiters) = {
             let mut state = self.state.lock().unwrap();
             if state.cancelled {
-                return;
+                return false;
             }
             state.cancelled = true;
             state.cancel_code = Some(code);
@@ -239,10 +257,13 @@ impl ProcessExecution {
         }
         // Do not wait on the caller's Store: kill(getpid(), SIGKILL) can arrive
         // inside that Store's host import. Retry outside locks until native
-        // execution returns, not merely until guest wait() is satisfied.
+        // execution returns, not merely until guest wait() is satisfied. An
+        // interrupt is declined while the Store is in host code, so a guest that
+        // leaves a long import into a syscall-free loop needs a later retry.
         let execution = self.clone();
         std::thread::spawn(move || {
             let start = Instant::now();
+            let mut warned = false;
             loop {
                 let handles = execution
                     .state
@@ -256,32 +277,44 @@ impl ProcessExecution {
                     tracing::debug!(pid = %execution.pid, "interrupt-worker-return");
                     return;
                 }
-                if start.elapsed() >= Duration::from_secs(2) {
+                let slow = start.elapsed() >= Duration::from_secs(2);
+                if slow && !warned {
+                    warned = true;
                     tracing::warn!(pid = %execution.pid, active = handles.len(), "forced-interrupt-unacknowledged");
-                    return;
                 }
                 for handle in handles {
                     handle.interrupt();
                 }
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(Duration::from_millis(if slow { 50 } else { 2 }));
             }
         });
+        true
     }
 
-    pub(crate) fn stop(&self, signal: Signal) {
+    /// Returns true when the process is already fully stopped (for example it
+    /// has no running Store); the caller must then `notify_parent` once it holds
+    /// no process lock.
+    pub(crate) fn stop(&self, signal: Signal) -> bool {
         let mut state = self.state.lock().unwrap();
-        if !state.cancelled {
-            state.stopped = Some(signal);
-            state.stop_reported = false;
-            state.stop_notified = false;
-            state.parked.clear();
-            tracing::debug!(pid = %self.pid, ?signal, active = state.active.len(), "process-stop-request");
-            let waiters = std::mem::take(&mut state.async_waiters);
-            drop(state);
-            for waiter in waiters {
-                waiter.wake();
-            }
+        if state.cancelled {
+            return false;
         }
+        state.stopped = Some(signal);
+        state.stop_reported = false;
+        state.stop_notified = false;
+        state.parked.clear();
+        tracing::debug!(pid = %self.pid, ?signal, active = state.active.len(), "process-stop-request");
+        let mut waiters = std::mem::take(&mut state.async_waiters);
+        let complete = Self::all_execution_parked(&state);
+        if complete {
+            state.stop_notified = true;
+            waiters.append(&mut state.stop_waiters);
+        }
+        drop(state);
+        for waiter in waiters {
+            waiter.wake();
+        }
+        complete
     }
 
     pub(crate) fn resume(&self) {
@@ -307,6 +340,12 @@ impl ProcessExecution {
                 .iter()
                 .filter_map(|(&id, store)| (store.worker == Some(worker)).then_some(id))
                 .collect();
+            if matching.is_empty() || Self::has_async_lease(&state) {
+                // An async process shares its executor thread with others (even
+                // while it briefly holds a native entry during instantiation):
+                // it parks at its next await (`poll_async`), never here.
+                return;
+            }
             for id in matching {
                 state.parked.insert(id);
             }
@@ -340,10 +379,12 @@ impl ProcessExecution {
     }
 
     pub(crate) fn poll_stop(&self, cx: &Context<'_>) -> Poll<Signal> {
-        if let Some(signal) = self.try_take_stop() {
-            return Poll::Ready(signal);
-        }
+        // Check and subscribe under one lock: notifiers drain stop_waiters under it.
         let mut state = self.state.lock().unwrap();
+        if state.stopped.is_some() && !state.stop_reported && Self::all_execution_parked(&state) {
+            state.stop_reported = true;
+            return Poll::Ready(state.stopped.unwrap());
+        }
         if !state.stop_waiters.iter().any(|w| w.will_wake(cx.waker())) {
             state.stop_waiters.push(cx.waker().clone());
         }
@@ -411,6 +452,19 @@ pub(crate) struct ExecutionGuard {
 impl ExecutionGuard {
     pub(crate) fn usage(&self) -> &Arc<super::usage::ProcessUsage> {
         &self.execution.usage
+    }
+
+    pub(crate) fn cancellation_code(&self) -> Option<ExitCode> {
+        let state = self.execution.state.lock().unwrap();
+        state.cancelled.then(|| state.cancel_code.unwrap_or(137i32.into()))
+    }
+
+    /// Lets a kill trap this lease's Store while its guest code is running.
+    pub(crate) fn set_interrupter(&self, interrupter: Interrupter) {
+        let mut state = self.execution.state.lock().unwrap();
+        if let Some(store) = state.active.get_mut(&self.id) {
+            store.interrupter = Some(interrupter);
+        }
     }
 
     pub(crate) fn poll_permitted(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExitCode>> {
@@ -550,6 +604,50 @@ mod tests {
             finished.status().into_finished().unwrap().unwrap(),
             141i32.into()
         );
+    }
+
+    #[test]
+    fn stop_without_running_store_is_reported_at_once() {
+        let process = Arc::new(ProcessExecution::new(11u32.into()));
+        assert!(process.stop(Signal::Sigstop));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(process.poll_stop(&mut cx), Poll::Ready(Signal::Sigstop));
+        assert_eq!(process.poll_stop(&mut cx), Poll::Pending);
+    }
+
+    #[test]
+    fn stopped_async_process_enters_without_blocking() {
+        let process = Arc::new(ProcessExecution::new(12u32.into()));
+        let lease = process.enter_async().unwrap();
+        process.stop(Signal::Sigstop);
+        let store = wasmer::Store::default();
+        // Would block the shared executor forever before the fix.
+        let native = process.enter(store.interrupter()).unwrap();
+        process.wait_if_stopped();
+        drop(native);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(lease.poll_permitted(&mut cx).is_pending());
+        assert_eq!(process.try_take_stop(), Some(Signal::Sigstop));
+    }
+
+    #[test]
+    fn async_lease_interrupter_is_used_by_cancel() {
+        let process = Arc::new(ProcessExecution::new(13u32.into()));
+        let lease = process.enter_async().unwrap();
+        lease.set_interrupter(wasmer::Store::default().interrupter());
+        assert!(
+            process
+                .state
+                .lock()
+                .unwrap()
+                .active
+                .values()
+                .all(|store| store.interrupter.is_some())
+        );
+        assert!(process.cancel());
+        assert!(!process.cancel());
+        drop(lease);
+        assert!(process.state.lock().unwrap().acknowledged);
     }
 
     #[test]

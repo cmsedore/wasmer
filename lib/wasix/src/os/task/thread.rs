@@ -657,6 +657,9 @@ pub enum WasiThreadError {
     /// This will happen if WASM is running in a thread has not been created by the spawn_wasm call
     #[error("WASM context is invalid")]
     InvalidWasmContext,
+    /// Every native worker is busy; the caller may retry (EAGAIN).
+    #[error("All native workers are busy")]
+    WorkersExhausted,
 }
 
 impl From<WasiThreadError> for Errno {
@@ -673,6 +676,7 @@ impl From<WasiThreadError> for Errno {
             WasiThreadError::InstanceCreateFailed(_) => Errno::Noexec,
             WasiThreadError::InitFailed(_) => Errno::Noexec,
             WasiThreadError::InvalidWasmContext => Errno::Noexec,
+            WasiThreadError::WorkersExhausted => Errno::Again,
         }
     }
 }
