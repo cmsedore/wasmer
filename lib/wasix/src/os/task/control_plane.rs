@@ -108,6 +108,11 @@ pub struct ProcessInfo {
     pub foreground: bool,
     pub threads: u32,
     pub argv: Vec<String>,
+    pub cpu_time_ns: Option<u64>,
+    pub cpu_percent: Option<f64>,
+    pub elapsed_ns: Option<u64>,
+    pub linear_memory_bytes: Option<u64>,
+    pub wait_reasons: Vec<&'static str>,
 }
 
 impl WasiControlPlane {
@@ -132,7 +137,7 @@ impl WasiControlPlane {
     }
 
     /// Inspect only this control plane. Never consumes wait/stop notifications.
-    /// `live` includes both runnable and blocked processes; no CPU sampling.
+    /// Worker CPU is attributed to this process; memory is primary linear memory.
     pub fn process_snapshot(&self) -> Vec<ProcessInfo> {
         let entries = {
             let state = self.state.mutable.read().unwrap();
@@ -177,18 +182,24 @@ impl WasiControlPlane {
                 continue;
             }
             let inner = process.lock();
+            #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+            let usage = inner.usage.snapshot();
             let state = if exited {
                 "zombie"
             } else {
                 #[cfg(all(unix, feature = "experimental-host-interrupt"))]
                 if inner.execution.is_stopped() {
                     "stopped"
+                } else if usage.running_workers > 0 {
+                    "running"
+                } else if !usage.wait_reasons.is_empty() {
+                    "waiting"
                 } else {
-                    "live"
+                    "ready"
                 }
                 #[cfg(not(all(unix, feature = "experimental-host-interrupt")))]
                 {
-                    "live"
+                    "unknown"
                 }
             };
             result.push(ProcessInfo {
@@ -200,6 +211,26 @@ impl WasiControlPlane {
                 foreground: foreground == Some(group.group),
                 threads: inner.thread_count,
                 argv: inner.argv.clone(),
+                #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+                cpu_time_ns: usage.cpu_time_ns,
+                #[cfg(not(all(unix, feature = "experimental-host-interrupt")))]
+                cpu_time_ns: None,
+                #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+                cpu_percent: usage.cpu_percent,
+                #[cfg(not(all(unix, feature = "experimental-host-interrupt")))]
+                cpu_percent: None,
+                #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+                elapsed_ns: Some(usage.elapsed_ns),
+                #[cfg(not(all(unix, feature = "experimental-host-interrupt")))]
+                elapsed_ns: None,
+                linear_memory_bytes: inner.memory_bytes.as_ref().map(|weak| {
+                    weak.upgrade()
+                        .map_or(0, |value| value.load(std::sync::atomic::Ordering::Acquire))
+                }),
+                #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+                wait_reasons: usage.wait_reasons,
+                #[cfg(not(all(unix, feature = "experimental-host-interrupt")))]
+                wait_reasons: vec![],
             });
         }
         result.sort_by_key(|p| p.pid);
@@ -508,7 +539,7 @@ mod tests {
         let execution = process.lock().execution.clone();
         let guard = execution.enter_async().unwrap();
         execution.stop(Signal::Sigstop);
-        assert_eq!(plane.process_snapshot()[0].state, "live");
+        assert_eq!(plane.process_snapshot()[0].state, "ready");
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(guard.poll_permitted(&mut cx).is_pending());
         for _ in 0..3 {
@@ -516,7 +547,7 @@ mod tests {
         }
         assert_eq!(process.try_take_stop_signal(), Some(Signal::Sigstop));
         execution.resume();
-        assert_eq!(plane.process_snapshot()[0].state, "live");
+        assert_eq!(plane.process_snapshot()[0].state, "ready");
     }
 
     #[cfg(all(unix, feature = "experimental-host-interrupt"))]

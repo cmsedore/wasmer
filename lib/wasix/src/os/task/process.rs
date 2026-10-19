@@ -48,6 +48,11 @@ pub struct AsyncExecution(super::execution::ExecutionGuard);
 
 #[cfg(all(unix, feature = "experimental-host-interrupt"))]
 impl AsyncExecution {
+    /// Account the CPU of one poll, without holding a worker across suspension.
+    pub fn poll_usage(&self) -> super::usage::UsageGuard {
+        self.0.usage().enter()
+    }
+
     /// Commit a bounded host-memory operation atomically with respect to stop/kill.
     /// The closure must not block, await, or call guest code.
     pub fn commit_if_permitted<T>(
@@ -66,6 +71,10 @@ impl AsyncExecution {
 
 #[cfg(all(unix, feature = "experimental-host-interrupt"))]
 impl WasiProcess {
+    pub fn usage(&self) -> Arc<super::usage::ProcessUsage> {
+        self.lock().usage.clone()
+    }
+
     pub fn begin_async_execution(&self) -> Option<AsyncExecution> {
         self.inner
             .0
@@ -192,6 +201,9 @@ pub struct WasiProcessInner {
     pub pid: WasiProcessId,
     /// Executable arguments for sandbox process inspection.
     pub(crate) argv: Vec<String>,
+    pub(crate) memory_bytes: Option<std::sync::Weak<std::sync::atomic::AtomicU64>>,
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    pub(crate) usage: Arc<super::usage::ProcessUsage>,
     /// Number of threads waiting for children to exit
     pub(crate) waiting: Arc<AtomicU32>,
     /// The threads that make up this process
@@ -468,10 +480,15 @@ impl WasiProcess {
         let max_cpu_cool_off_time = Duration::from_millis(500);
 
         let waiting = Arc::new(AtomicU32::new(0));
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        let usage = Arc::new(super::usage::ProcessUsage::new());
         let inner = Arc::new((
             Mutex::new(WasiProcessInner {
                 pid,
                 argv: Vec::new(),
+                memory_bytes: None,
+                #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+                usage: usage.clone(),
                 threads: Default::default(),
                 thread_count: Default::default(),
                 signal_intervals: Default::default(),
@@ -483,7 +500,7 @@ impl WasiProcess {
                 cleanup_started: false,
                 memory: Default::default(),
                 #[cfg(all(unix, feature = "experimental-host-interrupt"))]
-                execution: Arc::new(super::execution::ProcessExecution::new(pid)),
+                execution: Arc::new(super::execution::ProcessExecution::new(pid).with_usage(usage)),
                 waiting: waiting.clone(),
                 #[cfg(feature = "journal")]
                 snapshot_on: Default::default(),
@@ -549,8 +566,10 @@ impl WasiProcess {
         #[cfg(all(unix, feature = "experimental-host-interrupt"))]
         {
             // Control-plane allocation assigns the PID before any Store runs.
-            self.inner.0.lock().unwrap().execution = Arc::new(
+            let mut inner = self.inner.0.lock().unwrap();
+            inner.execution = Arc::new(
                 super::execution::ProcessExecution::new(pid)
+                    .with_usage(inner.usage.clone())
                     .with_control_plane(self.compute.clone(), self.finished.clone()),
             );
         }
@@ -725,7 +744,11 @@ impl WasiProcess {
     /// Registers the shared memory used by this process.
     pub fn register_memory(&self, memory: impl Into<MemoryOps>) {
         let mut inner = self.inner.0.lock().unwrap();
-        inner.memory = Some(memory.into());
+        let memory = memory.into();
+        if let Some(counter) = memory.size_counter() {
+            inner.memory_bytes = Some(counter);
+        }
+        inner.memory = Some(memory);
     }
 
     /// Takes a snapshot of the process and disables journaling returning

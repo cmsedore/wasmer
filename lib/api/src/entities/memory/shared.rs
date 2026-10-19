@@ -21,6 +21,7 @@ pub struct SharedMemory {
 /// may be attempted after the original memory owner has started shutting down.
 #[derive(Clone)]
 pub struct MemoryOps {
+    size_counter: Option<std::sync::Weak<std::sync::atomic::AtomicU64>>,
     ops: Option<Arc<dyn SharedMemoryOps + Send + Sync>>,
 }
 
@@ -71,6 +72,21 @@ impl SharedMemory {
     /// Create an operations handle that does not keep the underlying memory alive.
     pub fn ops(&self) -> MemoryOps {
         MemoryOps {
+            size_counter: {
+                #[cfg(feature = "sys")]
+                {
+                    use wasmer_vm::LinearMemory;
+                    match &self.memory {
+                        crate::vm::VMSharedMemory::Sys(memory) => memory.size_counter(),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    }
+                }
+                #[cfg(not(feature = "sys"))]
+                {
+                    None
+                }
+            },
             ops: self.ops.clone(),
         }
     }
@@ -122,6 +138,11 @@ impl SharedMemory {
 }
 
 impl MemoryOps {
+    /// Observe accessible memory bytes without retaining the allocation.
+    pub fn size_counter(&self) -> Option<std::sync::Weak<std::sync::atomic::AtomicU64>> {
+        self.size_counter.clone()
+    }
+
     #[inline]
     fn shared_ops(&self) -> Result<&(dyn SharedMemoryOps + Send + Sync), AtomicsError> {
         self.ops

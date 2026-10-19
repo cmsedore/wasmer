@@ -40,6 +40,7 @@ pub(crate) struct ProcessExecution {
     resumed: Condvar,
     control_plane: Option<WasiControlPlaneHandle>,
     finished: Option<Arc<OwnedTaskStatus>>,
+    usage: Arc<super::usage::ProcessUsage>,
 }
 
 impl std::fmt::Debug for ProcessExecution {
@@ -69,7 +70,13 @@ impl ProcessExecution {
             resumed: Condvar::new(),
             control_plane: None,
             finished: None,
+            usage: Arc::new(super::usage::ProcessUsage::new()),
         }
+    }
+
+    pub(crate) fn with_usage(mut self, usage: Arc<super::usage::ProcessUsage>) -> Self {
+        self.usage = usage;
+        self
     }
 
     pub(crate) fn with_control_plane(
@@ -103,7 +110,10 @@ impl ProcessExecution {
             .unwrap_or(137i32.into())
     }
 
-    pub(crate) fn enter(self: &Arc<Self>, interrupter: Interrupter) -> Option<ExecutionGuard> {
+    pub(crate) fn enter(
+        self: &Arc<Self>,
+        interrupter: Interrupter,
+    ) -> Option<NativeExecutionGuard> {
         let mut state = self.state.lock().unwrap();
         while state.stopped.is_some() && !state.cancelled {
             state = self.resumed.wait(state).unwrap();
@@ -121,9 +131,12 @@ impl ProcessExecution {
             },
         );
         tracing::debug!(pid = %self.pid, id, active = state.active.len(), native_thread = ?std::thread::current().id(), "execution-enter");
-        Some(ExecutionGuard {
-            execution: self.clone(),
-            id,
+        Some(NativeExecutionGuard {
+            _execution: ExecutionGuard {
+                execution: self.clone(),
+                id,
+            },
+            _usage: self.usage.enter(),
         })
     }
 
@@ -385,12 +398,21 @@ impl Drop for QuiescenceGuard {
     }
 }
 
+pub(crate) struct NativeExecutionGuard {
+    _execution: ExecutionGuard,
+    _usage: super::usage::UsageGuard,
+}
+
 pub(crate) struct ExecutionGuard {
     execution: Arc<ProcessExecution>,
     id: u64,
 }
 
 impl ExecutionGuard {
+    pub(crate) fn usage(&self) -> &Arc<super::usage::ProcessUsage> {
+        &self.execution.usage
+    }
+
     pub(crate) fn poll_permitted(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExitCode>> {
         self.execution.poll_async(self.id, cx)
     }

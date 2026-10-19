@@ -876,6 +876,8 @@ impl WasiEnv {
                     ?signal,
                     "processing signal via handler",
                 );
+                #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+                let _usage_callback = ctx.data().process.usage().guest_callback();
                 if let Err(err) = handler.call(ctx, signal as i32) {
                     match err.downcast::<WasiError>() {
                         Ok(wasi_err) => {

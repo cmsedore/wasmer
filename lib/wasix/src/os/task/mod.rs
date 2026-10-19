@@ -8,6 +8,8 @@ pub mod process;
 pub mod signal;
 mod task_join_handle;
 pub mod thread;
+#[cfg(all(unix, feature = "experimental-host-interrupt"))]
+pub mod usage;
 
 #[allow(unused_imports)]
 pub(crate) use process::WasiProcessInner;

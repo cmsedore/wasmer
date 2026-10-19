@@ -95,6 +95,20 @@ impl Memory {
         MemoryView::new(self, store)
     }
 
+    /// Observe native linear-memory allocation without borrowing its Store or
+    /// retaining its allocation after teardown. Other backends return None.
+    #[cfg(feature = "sys")]
+    pub fn size_counter(
+        &self,
+        store: &impl AsStoreRef,
+    ) -> Option<std::sync::Weak<std::sync::atomic::AtomicU64>> {
+        match &self.0 {
+            crate::BackendMemory::Sys(memory) => memory.size_counter(store),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     /// Retrieve the size of the memory in pages.
     pub fn size(&self, store: &impl AsStoreRef) -> Pages {
         self.0.size(store)

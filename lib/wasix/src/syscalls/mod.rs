@@ -307,6 +307,7 @@ where
 /// thus allowed for asynchronous operations to execute. It has built in functionality
 /// to (optionally) timeout the IO, force exit the process, callback signals and pump
 /// synchronous IO engine
+#[track_caller]
 pub(crate) fn __asyncify<T, Fut>(
     ctx: &mut FunctionEnvMut<'_, WasiEnv>,
     timeout: Option<Duration>,
@@ -316,6 +317,17 @@ where
     T: 'static,
     Fut: std::future::Future<Output = Result<T, Errno>>,
 {
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    let _usage_wait = ctx.data().process.usage().waiting(
+        std::panic::Location::caller()
+            .file()
+            .rsplit('/')
+            .next()
+            .unwrap_or("syscall")
+            .strip_suffix(".rs")
+            .unwrap_or("syscall"),
+    );
+
     let mut env = ctx.data();
 
     // Check if we need to exit the asynchronous loop
@@ -489,6 +501,7 @@ pub(crate) fn maybe_backoff<M: MemorySize>(
 /// or it will return an WasiError which will exit the WASM call using asyncify
 /// and instead process it on a shared task
 ///
+#[track_caller]
 pub(crate) fn __asyncify_with_deep_sleep<M: MemorySize, T, Fut>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     work: Fut,
@@ -497,6 +510,17 @@ where
     T: serde::Serialize + serde::de::DeserializeOwned,
     Fut: Future<Output = T> + Send + Sync + 'static,
 {
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    let _usage_wait = ctx.data().process.usage().waiting(
+        std::panic::Location::caller()
+            .file()
+            .rsplit('/')
+            .next()
+            .unwrap_or("syscall")
+            .strip_suffix(".rs")
+            .unwrap_or("syscall"),
+    );
+
     // Determine the deep sleep time
     let deep_sleep_time = match ctx.data().enable_journal {
         true => Duration::from_micros(100),
@@ -571,6 +595,7 @@ where
 /// thus allowed for asynchronous operations to execute. It has built in functionality
 /// to (optionally) timeout the IO, force exit the process, callback signals and pump
 /// synchronous IO engine
+#[track_caller]
 pub(crate) fn __asyncify_light<T, Fut>(
     env: &WasiEnv,
     _timeout: Option<Duration>,
@@ -580,6 +605,17 @@ where
     T: 'static,
     Fut: Future<Output = Result<T, Errno>>,
 {
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    let _usage_wait = env.process.usage().waiting(
+        std::panic::Location::caller()
+            .file()
+            .rsplit('/')
+            .next()
+            .unwrap_or("syscall")
+            .strip_suffix(".rs")
+            .unwrap_or("syscall"),
+    );
+
     let snapshot_wait = wait_for_snapshot(env);
 
     // Block until the work is finished or until we
@@ -589,6 +625,7 @@ where
 
 // Only the opt-in PipeRx read path uses this. Drop the I/O future (and its
 // borrowed guest buffers) before the outer syscall invokes guest callbacks.
+#[track_caller]
 pub(crate) fn __asyncify_light_signal_aware<T, Fut>(
     env: &WasiEnv,
     timeout: Option<Duration>,
@@ -598,6 +635,17 @@ where
     T: 'static,
     Fut: Future<Output = Result<T, Errno>>,
 {
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    let _usage_wait = env.process.usage().waiting(
+        std::panic::Location::caller()
+            .file()
+            .rsplit('/')
+            .next()
+            .unwrap_or("syscall")
+            .strip_suffix(".rs")
+            .unwrap_or("syscall"),
+    );
+
     if !env.process.signal_claims_enabled() || timeout == Some(Duration::ZERO) {
         return __asyncify_light(env, timeout, work);
     }

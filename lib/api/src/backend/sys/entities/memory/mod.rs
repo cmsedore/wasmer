@@ -56,6 +56,16 @@ impl Memory {
             .ty()
     }
 
+    /// Observe allocation size without keeping this memory alive.
+    pub fn size_counter(
+        &self,
+        store: &impl AsStoreRef,
+    ) -> Option<std::sync::Weak<std::sync::atomic::AtomicU64>> {
+        self.handle
+            .get(store.as_store_ref().objects().as_sys())
+            .size_counter()
+    }
+
     pub(crate) fn size(&self, store: &impl AsStoreRef) -> Pages {
         self.handle
             .get(store.as_store_ref().objects().as_sys())

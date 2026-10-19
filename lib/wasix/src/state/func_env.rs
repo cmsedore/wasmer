@@ -182,6 +182,14 @@ impl WasiFunctionEnv {
 
         let main_module_handles = new_inner.main_module_instance_handles();
         let shared_memory = main_module_handles.memory().as_shared(store);
+        #[cfg(any(feature = "sys", feature = "sys-minimal"))]
+        {
+            let memory = main_module_handles.memory();
+            let counter = memory.size_counter(store);
+            let mut process = self.data(store).process.lock();
+            process.memory_bytes = counter;
+        }
+
         let stack_pointer = main_module_handles.stack_pointer.clone();
         let data_end = main_module_handles.data_end.clone();
         let stack_low = main_module_handles.stack_low.clone();

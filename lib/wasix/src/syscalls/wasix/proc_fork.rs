@@ -116,6 +116,8 @@ pub fn proc_fork<M: MemorySize>(
             }
             child_env.swap_inner(ctx.data_mut());
             std::mem::swap(ctx.data_mut(), &mut child_env);
+            #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+            ctx.data().process.usage().rebind_current();
             let previous_vfork = ctx.data_mut().vfork.replace(WasiVFork {
                 asyncify: Some(WasiVForkAsyncify {
                     rewind_stack: rewind_stack.clone(),
@@ -271,7 +273,9 @@ fn run<M: MemorySize>(
 ) -> ExitCode {
     if ctx.data(&store).runtime().detached_exec_images() {
         // Transfer the fork thread's ownership with an exec image.
-        ctx.data_mut(&mut store).owned_handles.push(child_handle.clone());
+        ctx.data_mut(&mut store)
+            .owned_handles
+            .push(child_handle.clone());
     }
     let env = ctx.data(&store);
     let tasks = env.tasks().clone();

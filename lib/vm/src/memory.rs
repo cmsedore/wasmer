@@ -19,13 +19,17 @@ use std::cell::UnsafeCell;
 use std::convert::TryInto;
 use std::ptr::NonNull;
 use std::slice;
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, RwLock, Weak,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 use wasmer_types::{Bytes, MemoryError, MemoryStyle, MemoryType, Pages, WASM_PAGE_SIZE};
 
 // The memory mapped area
 #[derive(Debug)]
 struct WasmMmap {
+    allocated_bytes: Arc<AtomicU64>,
     // Our OS allocation of mmap'd memory.
     alloc: Mmap,
     // The current logical size in wasm pages of this linear memory.
@@ -121,6 +125,8 @@ impl WasmMmap {
         }
 
         self.size = new_pages;
+        self.allocated_bytes
+            .store(new_bytes as u64, Ordering::Release);
 
         // update memory definition
         unsafe {
@@ -149,6 +155,7 @@ impl WasmMmap {
     /// Resets the memory down to a zero size
     fn reset(&mut self) -> Result<(), MemoryError> {
         self.size.0 = 0;
+        self.allocated_bytes.store(0, Ordering::Release);
         // update memory definition
         unsafe {
             let mut md_ptr = self.vm_memory_definition.as_ptr();
@@ -168,6 +175,7 @@ impl WasmMmap {
             .map_err(MemoryError::Generic)?;
         let base_ptr = alloc.as_mut_ptr();
         Ok(Self {
+            allocated_bytes: Arc::new(AtomicU64::new(mem_length as u64)),
             vm_memory_definition: MaybeInstanceOwned::Host(Box::new(UnsafeCell::new(
                 VMMemoryDefinition {
                     base: base_ptr,
@@ -359,6 +367,7 @@ impl VMOwnedMemory {
                 .0
                 .max(alloc.as_slice_accessible().len());
             let mmap = WasmMmap {
+                allocated_bytes: Arc::new(AtomicU64::new(mem_length as u64)),
                 vm_memory_definition: if let Some(mem_loc) = vm_memory_location {
                     {
                         let mut ptr = mem_loc;
@@ -418,6 +427,10 @@ impl LinearMemory for VMOwnedMemory {
     /// Returns the size of the memory in pages
     fn size(&self) -> Pages {
         self.mmap.size()
+    }
+
+    fn size_counter(&self) -> Option<Weak<AtomicU64>> {
+        Some(Arc::downgrade(&self.mmap.allocated_bytes))
     }
 
     /// Returns the memory style for this memory.
@@ -574,6 +587,10 @@ impl LinearMemory for VMSharedMemory {
         guard.size()
     }
 
+    fn size_counter(&self) -> Option<Weak<AtomicU64>> {
+        Some(Arc::downgrade(&self.mmap.read().unwrap().allocated_bytes))
+    }
+
     /// Returns the memory style for this memory.
     fn style(&self) -> MemoryStyle {
         self.config.style()
@@ -679,6 +696,10 @@ impl LinearMemory for VMMemory {
     /// Returns the size of the memory in pages
     fn size(&self) -> Pages {
         self.0.size()
+    }
+
+    fn size_counter(&self) -> Option<Weak<AtomicU64>> {
+        self.0.size_counter()
     }
 
     /// Grow memory by the specified amount of wasm pages.
@@ -847,6 +868,12 @@ where
 
     /// Returns the size of the memory in pages
     fn size(&self) -> Pages;
+
+    /// A weak, thread-safe counter of accessible linear-memory bytes.
+    /// Custom memory backends may leave accounting unsupported.
+    fn size_counter(&self) -> Option<Weak<AtomicU64>> {
+        None
+    }
 
     /// Returns the memory style for this memory.
     fn style(&self) -> MemoryStyle;

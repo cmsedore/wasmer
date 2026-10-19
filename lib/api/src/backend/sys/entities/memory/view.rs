@@ -202,8 +202,10 @@ impl<'a> MemoryView<'a> {
         amount: u64,
         new_memory: &Self,
     ) -> Result<(), MemoryAccessError> {
-        let source_offset = usize::try_from(source_offset).map_err(|_| MemoryAccessError::Overflow)?;
-        let target_offset = usize::try_from(target_offset).map_err(|_| MemoryAccessError::Overflow)?;
+        let source_offset =
+            usize::try_from(source_offset).map_err(|_| MemoryAccessError::Overflow)?;
+        let target_offset =
+            usize::try_from(target_offset).map_err(|_| MemoryAccessError::Overflow)?;
         let amount = usize::try_from(amount).map_err(|_| MemoryAccessError::Overflow)?;
         let source_end = source_offset
             .checked_add(amount)
