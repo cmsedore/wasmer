@@ -203,6 +203,22 @@ impl TaskJoinHandle {
                 }
             }
         });
+
+        #[cfg(unix)]
+        {
+            let signal_handler = self.signal_handler.clone();
+            if let Ok(mut stops) = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::from_raw(libc::SIGTSTP),
+            ) {
+                tokio::spawn(async move {
+                    while stops.recv().await.is_some() {
+                        if let Err(err) = signal_handler.signal(Signal::Sigtstp.to_native() as u8) {
+                            tracing::error!("failed to process terminal stop signal - {}", err);
+                        }
+                    }
+                });
+            }
+        }
     }
 
     /// Wait until the task finishes.

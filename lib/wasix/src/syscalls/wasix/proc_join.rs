@@ -11,7 +11,62 @@ use crate::{WasiProcess, syscalls::*};
 enum JoinStatusResult {
     Nothing,
     ExitNormal(WasiProcessId, ExitCode),
+    Stopped(WasiProcessId, Signal),
     Err(Errno),
+}
+
+async fn wait_child_event(process: WasiProcess, wake_stopped: bool) -> JoinStatusResult {
+    let pid = process.pid();
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    if wake_stopped {
+        use futures::future::{Either, select};
+        return match select(
+            Box::pin(process.join()),
+            Box::pin(process.wait_for_stop_signal()),
+        )
+        .await
+        {
+            Either::Left((status, _)) => {
+                JoinStatusResult::ExitNormal(pid, status.unwrap_or_else(|_| Errno::Child.into()))
+            }
+            Either::Right((signal, _)) => JoinStatusResult::Stopped(pid, signal),
+        };
+    }
+    let _ = wake_stopped;
+    JoinStatusResult::ExitNormal(
+        pid,
+        process.join().await.unwrap_or_else(|_| Errno::Child.into()),
+    )
+}
+
+fn ready_child_event(process: &WasiProcess, wake_stopped: bool) -> Option<JoinStatusResult> {
+    if let Some(status) = process.try_join() {
+        return Some(JoinStatusResult::ExitNormal(
+            process.pid(),
+            status.unwrap_or_else(|_| Errno::Child.into()),
+        ));
+    }
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    if wake_stopped {
+        if let Some(signal) = process.try_take_stop_signal() {
+            return Some(JoinStatusResult::Stopped(process.pid(), signal));
+        }
+    }
+    let _ = wake_stopped;
+    None
+}
+
+fn finish_child_event(parent: &WasiProcess, result: JoinStatusResult) -> JoinStatusResult {
+    if let JoinStatusResult::ExitNormal(pid, _) = result {
+        parent
+            .inner
+            .0
+            .lock()
+            .unwrap()
+            .children
+            .retain(|child| child.pid() != pid);
+    }
+    result
 }
 
 /// ### `proc_join()`
@@ -66,6 +121,21 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
                         },
                     }
                 }
+                JoinStatusResult::Stopped(pid, signal) => {
+                    pid_ptr
+                        .write(
+                            &view,
+                            OptionPid {
+                                tag: OptionTag::Some,
+                                pid: pid.raw() as Pid,
+                            },
+                        )
+                        .ok();
+                    JoinStatus {
+                        tag: JoinStatusType::Stopped,
+                        u: JoinStatusUnion { stopped: signal },
+                    }
+                }
                 JoinStatusResult::Err(err) => {
                     ret = err;
                     JoinStatus {
@@ -113,94 +183,46 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
         }
     ));
 
-    // If the ID is maximum then it means wait for any of the children
-    let pid = match option_pid {
-        None => {
-            let mut process = ctx.data_mut().process.clone();
-
-            // We wait for any process to exit (if it takes too long
-            // then we go into a deep sleep)
-            let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, async move {
-                let child_exit = process.join_any_child().await;
-                match child_exit {
-                    Ok(Some((pid, exit_code))) => {
-                        tracing::trace!(%pid, %exit_code, "triggered child join");
-                        trace!(ret_id = pid.raw(), exit_code = exit_code.raw());
-                        JoinStatusResult::ExitNormal(pid, exit_code)
-                    }
-                    Ok(None) => {
-                        tracing::trace!("triggered child join (no child)");
-                        JoinStatusResult::Err(Errno::Child)
-                    }
-                    Err(err) => {
-                        tracing::trace!(%err, "error triggered on child join");
-                        JoinStatusResult::Err(err)
-                    }
-                }
-            })?;
-            return match res {
-                AsyncifyAction::Finish(ctx, result) => ret_result(ctx, result),
-                AsyncifyAction::Unwind => Ok(Errno::Success),
-            };
+    let parent = ctx.data().process.clone();
+    let children = match option_pid {
+        None => parent.inner.0.lock().unwrap().children.clone(),
+        Some(raw_pid) => {
+            let pid: WasiProcessId = raw_pid.into();
+            let child = parent
+                .inner
+                .0
+                .lock()
+                .unwrap()
+                .children
+                .iter()
+                .find(|child| child.pid() == pid)
+                .cloned()
+                .or_else(|| ctx.data().control_plane.get_process(pid));
+            child.into_iter().collect()
         }
-        Some(pid) => pid,
     };
-
-    // Otherwise we wait for the specific PID
-    let pid: WasiProcessId = pid.into();
-
-    // Waiting for a process that is an explicit child will join it
-    // meaning it will no longer be a sub-process of the main process
-    let mut process = {
-        let mut inner = ctx.data().process.lock();
-        let process = inner
-            .children
-            .iter()
-            .filter(|c| c.pid == pid)
-            .map(Clone::clone)
-            .next();
-        inner.children.retain(|c| c.pid != pid);
-        process
-    };
-
-    // Otherwise it could be the case that we are waiting for a process
-    // that is not a child of this process but may still be running
-    if process.is_none() {
-        process = ctx.data().control_plane.get_process(pid);
+    if children.is_empty() {
+        return ret_result(ctx, JoinStatusResult::Err(Errno::Child));
     }
-
-    if let Some(process) = process {
-        // We can already set the process ID
-        wasi_try_mem_ok!(pid_ptr.write(
-            &memory,
-            OptionPid {
-                tag: OptionTag::Some,
-                pid: pid.raw(),
-            }
-        ));
-
-        if flags.contains(JoinFlags::NON_BLOCKING) {
-            if let Some(status) = process.try_join() {
-                let exit_code = status.unwrap_or_else(|_| Errno::Child.into());
-                ret_result(ctx, JoinStatusResult::ExitNormal(pid, exit_code))
-            } else {
-                ret_result(ctx, JoinStatusResult::Nothing)
-            }
-        } else {
-            // Wait for the process to finish
-            let process2 = process.clone();
-            let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, async move {
-                let exit_code = process.join().await.unwrap_or_else(|_| Errno::Child.into());
-                tracing::trace!(%exit_code, "triggered child join");
-                JoinStatusResult::ExitNormal(pid, exit_code)
-            })?;
-            match res {
-                AsyncifyAction::Finish(ctx, result) => ret_result(ctx, result),
-                AsyncifyAction::Unwind => Ok(Errno::Success),
-            }
+    let wake_stopped = flags.contains(JoinFlags::WAKE_STOPPED);
+    for child in &children {
+        if let Some(result) = ready_child_event(child, wake_stopped) {
+            return ret_result(ctx, finish_child_event(&parent, result));
         }
-    } else {
-        trace!(ret_id = pid.raw(), "status=nothing");
-        ret_result(ctx, JoinStatusResult::Nothing)
+    }
+    if flags.contains(JoinFlags::NON_BLOCKING) {
+        return ret_result(ctx, JoinStatusResult::Nothing);
+    }
+    let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, async move {
+        let waits = children
+            .into_iter()
+            .map(|child| Box::pin(wait_child_event(child, wake_stopped)))
+            .collect::<Vec<_>>();
+        let result = futures::future::select_all(waits).await.0;
+        finish_child_event(&parent, result)
+    })?;
+    match res {
+        AsyncifyAction::Finish(ctx, result) => ret_result(ctx, result),
+        AsyncifyAction::Unwind => Ok(Errno::Success),
     }
 }

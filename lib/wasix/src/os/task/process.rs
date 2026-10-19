@@ -461,7 +461,7 @@ impl WasiProcess {
         impl SignalHandlerAbi for SignalHandler {
             fn signal(&self, signal: u8) -> Result<(), SignalDeliveryError> {
                 if let Ok(signal) = signal.try_into() {
-                    if signal == Signal::Sigint
+                    if matches!(signal, Signal::Sigint | Signal::Sigtstp)
                         && self
                             .1
                             .upgrade()
@@ -509,8 +509,10 @@ impl WasiProcess {
         #[cfg(all(unix, feature = "experimental-host-interrupt"))]
         {
             // Control-plane allocation assigns the PID before any Store runs.
-            self.inner.0.lock().unwrap().execution =
-                Arc::new(super::execution::ProcessExecution::new(pid));
+            self.inner.0.lock().unwrap().execution = Arc::new(
+                super::execution::ProcessExecution::new(pid)
+                    .with_control_plane(self.compute.clone(), self.finished.clone()),
+            );
         }
     }
 
@@ -862,6 +864,17 @@ impl WasiProcess {
         self.finished.status().into_finished()
     }
 
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    pub(crate) fn try_take_stop_signal(&self) -> Option<Signal> {
+        self.inner.0.lock().unwrap().execution.try_take_stop()
+    }
+
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    pub(crate) async fn wait_for_stop_signal(&self) -> Signal {
+        let execution = self.inner.0.lock().unwrap().execution.clone();
+        std::future::poll_fn(|cx| execution.poll_stop(cx)).await
+    }
+
     /// Waits for all the children to be finished
     pub async fn join_children(&mut self) -> Option<Result<ExitCode, Arc<WasiRuntimeError>>> {
         let _guard = WasiProcessWait::new(self);
@@ -928,13 +941,22 @@ impl WasiProcess {
         // Need special logic for the main thread.
         let guard = self.inner.0.lock().unwrap();
         #[cfg(all(unix, feature = "experimental-host-interrupt"))]
-        let exit_code = if guard.execution.is_cancelled() {
+        let cancelled = guard.execution.is_cancelled();
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        let exit_code = if cancelled {
             ExitCode::from(137)
         } else {
             exit_code
         };
         for thread in guard.threads.values() {
             thread.set_status_finished(Ok(exit_code))
+        }
+        drop(guard);
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        if !cancelled {
+            if let Some(plane) = self.compute.upgrade() {
+                plane.notify_parent_child_event(pid);
+            }
         }
     }
 }
@@ -990,6 +1012,22 @@ fn signal_process_internal(
     #[cfg(all(unix, feature = "experimental-host-interrupt"))]
     if signal == Signal::Sigkill {
         guard.execution.cancel();
+    }
+
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    if matches!(
+        signal,
+        Signal::Sigstop | Signal::Sigtstp | Signal::Sigttin | Signal::Sigttou
+    ) {
+        guard.execution.stop(signal);
+        for thread in guard.threads.values() {
+            thread.signal(Signal::Sigwakeup);
+        }
+        return;
+    }
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    if signal == Signal::Sigcont {
+        guard.execution.resume();
     }
 
     if guard.process_signals.enqueue(signal) {

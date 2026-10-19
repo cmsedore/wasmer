@@ -308,6 +308,18 @@ impl WasiControlPlane {
         true
     }
 
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    pub(crate) fn notify_parent_child_event(&self, pid: WasiProcessId) {
+        let parent = {
+            let state = self.state.mutable.read().unwrap();
+            let parent_pid = state.groups.get(&pid).and_then(|info| info.parent);
+            parent_pid.and_then(|id| state.processes.get(&id).cloned())
+        };
+        if let Some(parent) = parent {
+            parent.signal_process_only(Signal::Sigchld);
+        }
+    }
+
     /// Generates a new process ID
     pub fn generate_id(&self) -> Result<WasiProcessId, ControlPlaneError> {
         let mut mutable = self.state.mutable.write().unwrap();

@@ -698,6 +698,11 @@ impl WasiEnv {
 
     /// Processes any signals that are batched up or any forced exit codes
     pub fn process_signals_and_exit(ctx: &mut FunctionEnvMut<'_, Self>) -> WasiResult<bool> {
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        {
+            let execution = ctx.data().process.inner.0.lock().unwrap().execution.clone();
+            execution.wait_if_stopped();
+        }
         // If a signal handler has never been set then we need to handle signals
         // differently
         let env = ctx.data();

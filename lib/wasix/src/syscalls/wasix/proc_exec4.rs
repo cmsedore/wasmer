@@ -299,6 +299,17 @@ pub(crate) fn proc_exec4_impl<M: MemorySize>(
                     // The old exec image shares the guest thread's queue with
                     // its replacement. It must not consume that image's signals
                     // or invoke the obsolete image's callback while waiting.
+                    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+                    let _quiescent = ctx
+                        .data()
+                        .process
+                        .inner
+                        .0
+                        .lock()
+                        .unwrap()
+                        .execution
+                        .clone()
+                        .quiesce_current_worker();
                     let code =
                         block_on(process.wait_finished()).unwrap_or_else(|_| Errno::Child.into());
                     return Err(WasiError::Exit(code));
