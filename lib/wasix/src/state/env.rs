@@ -815,6 +815,13 @@ impl WasiEnv {
                 }
             }
 
+            if ctx.data().process.pending_process_signal_mask() != 0 {
+                // Matching libc treats signal zero as a drain notification.
+                // Mask inspection and claiming happen inside that thread's
+                // critical section, never from a stale host-side mask cache.
+                signals.insert(0, Signal::Signone);
+            }
+
             for signal in signals {
                 // Skip over Sigwakeup, which is host-side-only
                 if matches!(signal, Signal::Sigwakeup) {

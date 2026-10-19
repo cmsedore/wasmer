@@ -49,8 +49,31 @@ pub fn fd_read<M: MemorySize>(
         ctx = wasi_try_ok!(maybe_snapshot_once::<M>(ctx, SnapshotTrigger::FirstStdin)?);
     }
 
-    let res = fd_read_internal::<M>(&mut ctx, fd, fd_entry, iovs, iovs_len, offset, nread, true)?;
-    fd_read_internal_handler(ctx, res, nread)
+    let signal_pipe = ctx.data().process.signal_claims_enabled()
+        && matches!(&*fd_entry.inode.read(), Kind::PipeRx { .. });
+    loop {
+        let observed = ctx.data().thread.nonrestart_signal_count();
+        let res = fd_read_internal::<M>(
+            &mut ctx,
+            fd,
+            fd_entry.clone(),
+            iovs,
+            iovs_len,
+            offset,
+            nread,
+            true,
+        )?;
+        if signal_pipe && matches!(res, Err(Errno::Intr)) {
+            // fd_read_internal returned and dropped every guest-memory borrow.
+            WasiEnv::do_pending_operations(&mut ctx)?;
+            if observed == ctx.data().thread.nonrestart_signal_count() {
+                // No handler on this thread, or all delivered handlers requested
+                // SA_RESTART. A wake notification must not expose a false EINTR.
+                continue;
+            }
+        }
+        return fd_read_internal_handler(ctx, res, nread);
+    }
 }
 
 /// ### `fd_pread()`
@@ -299,7 +322,7 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
 
                     let nonblocking = fd_flags.contains(Fdflags::NONBLOCK);
 
-                    let res = __asyncify_light(
+                    let res = __asyncify_light_signal_aware(
                         env,
                         if fd_flags.contains(Fdflags::NONBLOCK) {
                             Some(Duration::ZERO)

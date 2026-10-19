@@ -10,7 +10,7 @@ use crate::{
 };
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
@@ -239,6 +239,7 @@ struct WasiThreadState {
     pid: WasiProcessId,
     id: WasiThreadId,
     signals: Mutex<(Vec<Signal>, Vec<Waker>)>,
+    nonrestart_signals: AtomicU64,
     stack: Mutex<ThreadStack>,
     status: Arc<OwnedTaskStatus>,
     #[cfg(feature = "journal")]
@@ -269,6 +270,7 @@ impl WasiThread {
                 id,
                 status,
                 signals: Mutex::new((Vec::new(), Vec::new())),
+                nonrestart_signals: AtomicU64::new(0),
                 stack: Mutex::new(ThreadStack::default()),
                 #[cfg(feature = "journal")]
                 check_pointing: AtomicBool::new(false),
@@ -342,6 +344,16 @@ impl WasiThread {
     /// Attempts to join on the thread
     pub fn try_join(&self) -> Option<Result<ExitCode, Arc<WasiRuntimeError>>> {
         self.state.status.status().into_finished()
+    }
+
+    pub(crate) fn record_signal_handler(&self, restart: bool) {
+        if !restart {
+            self.state.nonrestart_signals.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn nonrestart_signal_count(&self) -> u64 {
+        self.state.nonrestart_signals.load(Ordering::SeqCst)
     }
 
     /// Adds a signal for this thread to process

@@ -587,6 +587,36 @@ where
     Ok(block_on(work))
 }
 
+// Only the opt-in PipeRx read path uses this. Drop the I/O future (and its
+// borrowed guest buffers) before the outer syscall invokes guest callbacks.
+pub(crate) fn __asyncify_light_signal_aware<T, Fut>(
+    env: &WasiEnv,
+    timeout: Option<Duration>,
+    work: Fut,
+) -> WasiResult<T>
+where
+    T: 'static,
+    Fut: Future<Output = Result<T, Errno>>,
+{
+    if !env.process.signal_claims_enabled() || timeout == Some(Duration::ZERO) {
+        return __asyncify_light(env, timeout, work);
+    }
+    let mut work = Box::pin(work);
+    let poller = futures::future::poll_fn(|cx| {
+        if let Some(exit_code) = env.should_exit() {
+            return Poll::Ready(Err(WasiError::Exit(exit_code)));
+        }
+        if let Poll::Ready(result) = work.as_mut().poll(cx) {
+            return Poll::Ready(Ok(result));
+        }
+        if env.thread.has_signals_or_subscribe(cx.waker()) {
+            return Poll::Ready(Ok(Err(Errno::Intr)));
+        }
+        Poll::Pending
+    });
+    block_on_with_timeout(env.tasks(), timeout, poller)
+}
+
 // This should be compiled away, it will simply wait forever however its never
 // used by itself, normally this is passed into asyncify which will still abort
 // the operating on timeouts, signals or other work due to a select! around the await

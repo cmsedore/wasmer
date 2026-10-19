@@ -163,6 +163,7 @@ pub struct WasiProcessInner {
     pub thread_count: u32,
     /// Signals that will be triggered at specific intervals
     pub signal_intervals: HashMap<Signal, WasiSignalInterval>,
+    pub(crate) process_signals: super::signal::ProcessSignalQueue,
     /// List of all the children spawned from this thread
     pub children: Vec<WasiProcess>,
     /// Represents a checkpoint which blocks all the threads
@@ -435,6 +436,7 @@ impl WasiProcess {
                 threads: Default::default(),
                 thread_count: Default::default(),
                 signal_intervals: Default::default(),
+                process_signals: Default::default(),
                 children: Default::default(),
                 checkpoint: WasiProcessCheckpoint::Execute,
                 wakers: Default::default(),
@@ -633,6 +635,35 @@ impl WasiProcess {
     /// Signals all the threads in this process
     pub fn signal_process(&self, signal: Signal) {
         signal_process_internal(&self.inner, signal, true);
+    }
+
+    pub(crate) fn claim_process_signal(&self, tid: WasiThreadId, blocked: u64) -> Option<Signal> {
+        let mut inner = self.inner.0.lock().unwrap();
+        if inner.threads.get(&tid)?.try_join().is_some() {
+            return None;
+        }
+        let signal = inner.process_signals.claim(blocked);
+        if let Some(signal) = signal {
+            tracing::debug!(pid=%self.pid(), %tid, ?signal, "process-signal-claimed");
+        }
+        signal
+    }
+
+    pub(crate) fn signal_claims_enabled(&self) -> bool {
+        self.inner.0.lock().unwrap().process_signals.enabled()
+    }
+
+    pub(crate) fn pending_process_signal_mask(&self) -> u64 {
+        self.inner.0.lock().unwrap().process_signals.pending_mask()
+    }
+
+    pub(crate) fn reset_process_signals_for_exec(&self) -> Vec<Signal> {
+        self.inner
+            .0
+            .lock()
+            .unwrap()
+            .process_signals
+            .reset_for_exec()
     }
 
     /// Includes native execution that has not acknowledged a logical exit yet.
@@ -953,6 +984,16 @@ fn signal_process_internal(
     #[cfg(all(unix, feature = "experimental-host-interrupt"))]
     if signal == Signal::Sigkill {
         guard.execution.cancel();
+    }
+
+    if guard.process_signals.enqueue(signal) {
+        tracing::debug!(%pid, ?signal, "process-signal-pending");
+        // Wake each candidate; these notifications carry no guest signal.
+        // The shared pending entry is removed only by a successful claim.
+        for thread in guard.threads.values() {
+            thread.signal(Signal::Sigwakeup);
+        }
+        return;
     }
 
     // Otherwise just send the signal to all the threads

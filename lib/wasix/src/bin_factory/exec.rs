@@ -141,6 +141,12 @@ pub fn spawn_exec_module(
         env.state
             .signal_handler_registered
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        // An exec may replace the opt-in libc with an older or WASIp1 image.
+        // Keep pending signals, but restore the legacy route until the new
+        // image explicitly opts in through its first claim.
+        for signal in env.process.reset_process_signals_for_exec() {
+            env.thread.signal(signal);
+        }
     }
     {
         // Create a thread that will run this process
