@@ -86,6 +86,11 @@ impl ProcessExecution {
         !self.state.lock().unwrap().active.is_empty()
     }
 
+    pub(crate) fn is_stopped(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.stopped.is_some() && Self::all_execution_parked(&state)
+    }
+
     pub(crate) fn is_cancelled(&self) -> bool {
         self.state.lock().unwrap().cancelled
     }

@@ -97,6 +97,19 @@ struct ProcessGroupInfo {
     session: u32,
 }
 
+/// A read-only, best-effort snapshot of one sandbox process.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
+    pub sid: u32,
+    pub state: &'static str,
+    pub foreground: bool,
+    pub threads: u32,
+    pub argv: Vec<String>,
+}
+
 impl WasiControlPlane {
     pub fn new(config: ControlPlaneConfig) -> Self {
         Self {
@@ -116,6 +129,81 @@ impl WasiControlPlane {
 
     pub fn handle(&self) -> WasiControlPlaneHandle {
         WasiControlPlaneHandle::new(&self.state)
+    }
+
+    /// Inspect only this control plane. Never consumes wait/stop notifications.
+    /// `live` includes both runnable and blocked processes; no CPU sampling.
+    pub fn process_snapshot(&self) -> Vec<ProcessInfo> {
+        let entries = {
+            let state = self.state.mutable.read().unwrap();
+            state
+                .processes
+                .iter()
+                .map(|(pid, process)| {
+                    (
+                        *pid,
+                        process.clone(),
+                        state.groups[pid],
+                        state.foreground_group,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        // The registry retains historical processes. Only an exited child still
+        // in its parent's wait set is a zombie; reaped history must stay hidden.
+        let wait_sets = entries
+            .iter()
+            .map(|(pid, process, _, _)| {
+                (
+                    *pid,
+                    process
+                        .lock()
+                        .children
+                        .iter()
+                        .map(|p| p.pid())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut result = Vec::new();
+        for (pid, process, group, foreground) in entries {
+            let exited = process.try_join().is_some() && !process.has_active_execution();
+            if exited
+                && !group
+                    .parent
+                    .and_then(|p| wait_sets.get(&p))
+                    .is_some_and(|children| children.contains(&pid))
+            {
+                continue;
+            }
+            let inner = process.lock();
+            let state = if exited {
+                "zombie"
+            } else {
+                #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+                if inner.execution.is_stopped() {
+                    "stopped"
+                } else {
+                    "live"
+                }
+                #[cfg(not(all(unix, feature = "experimental-host-interrupt")))]
+                {
+                    "live"
+                }
+            };
+            result.push(ProcessInfo {
+                pid: pid.raw(),
+                ppid: group.parent.map_or(0, |p| p.raw()),
+                pgid: group.group,
+                sid: group.session,
+                state,
+                foreground: foreground == Some(group.group),
+                threads: inner.thread_count,
+                argv: inner.argv.clone(),
+            });
+        }
+        result.sort_by_key(|p| p.pid);
+        result
     }
 
     /// Get the current count of active tasks (threads).
@@ -385,6 +473,51 @@ mod tests {
     use crate::os::task::thread::WasiMemoryLayout;
 
     use super::*;
+
+    #[test]
+    fn test_process_snapshot_hides_reaped_history_and_other_planes() {
+        let plane = WasiControlPlane::default();
+        let root = plane.new_process(ModuleHash::random()).unwrap();
+        let child = plane
+            .new_child_process(ModuleHash::random(), root.pid())
+            .unwrap();
+        root.lock().children.push(child.clone());
+        child.lock().argv = vec!["tool".into(), "two words".into(), "".into()];
+        plane
+            .set_process_group(root.pid(), child.pid(), child.pid().raw())
+            .unwrap();
+        let other = WasiControlPlane::default();
+        other.new_process(ModuleHash::random()).unwrap().lock().argv = vec!["other-sandbox".into()];
+        let rows = plane.process_snapshot();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].ppid, root.pid().raw());
+        assert_eq!(rows[1].pgid, child.pid().raw());
+        assert_eq!(rows[1].argv, ["tool", "two words", ""]);
+        child.finished.set_finished(Ok(0i32.into()));
+        assert_eq!(plane.process_snapshot()[1].state, "zombie");
+        root.lock().children.clear();
+        assert_eq!(plane.process_snapshot().len(), 1);
+        assert_eq!(other.process_snapshot()[0].argv, ["other-sandbox"]);
+    }
+
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    #[test]
+    fn test_process_snapshot_does_not_consume_stop_events() {
+        let plane = WasiControlPlane::default();
+        let process = plane.new_process(ModuleHash::random()).unwrap();
+        let execution = process.lock().execution.clone();
+        let guard = execution.enter_async().unwrap();
+        execution.stop(Signal::Sigstop);
+        assert_eq!(plane.process_snapshot()[0].state, "live");
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(guard.poll_permitted(&mut cx).is_pending());
+        for _ in 0..3 {
+            assert_eq!(plane.process_snapshot()[0].state, "stopped");
+        }
+        assert_eq!(process.try_take_stop_signal(), Some(Signal::Sigstop));
+        execution.resume();
+        assert_eq!(plane.process_snapshot()[0].state, "live");
+    }
 
     #[cfg(all(unix, feature = "experimental-host-interrupt"))]
     #[test]

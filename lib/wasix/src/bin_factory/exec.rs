@@ -134,6 +134,8 @@ pub fn spawn_exec_module(
     // Create the signaler
     let pid = env.pid();
 
+    env.process.lock().argv = env.state.args.lock().unwrap().clone();
+
     let join_handle = env.thread.join_handle();
     {
         // Callback registration belongs to an executable image. An exec from

@@ -190,6 +190,8 @@ impl Into<Range<u64>> for MemorySnapshotRegion {
 pub struct WasiProcessInner {
     /// Unique ID of this process
     pub pid: WasiProcessId,
+    /// Executable arguments for sandbox process inspection.
+    pub(crate) argv: Vec<String>,
     /// Number of threads waiting for children to exit
     pub(crate) waiting: Arc<AtomicU32>,
     /// The threads that make up this process
@@ -469,6 +471,7 @@ impl WasiProcess {
         let inner = Arc::new((
             Mutex::new(WasiProcessInner {
                 pid,
+                argv: Vec::new(),
                 threads: Default::default(),
                 thread_count: Default::default(),
                 signal_intervals: Default::default(),

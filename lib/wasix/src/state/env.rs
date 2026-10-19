@@ -263,6 +263,7 @@ impl WasiEnv {
         thread.copy_stack_from(&self.thread);
 
         let state = Arc::new(self.state.fork());
+        process.lock().argv = state.args.lock().unwrap().clone();
 
         let bin_factory = self.bin_factory.clone();
 
@@ -407,6 +408,7 @@ impl WasiEnv {
         } else {
             init.control_plane.new_process(module_hash)?
         };
+        process.lock().argv = init.state.args.lock().unwrap().clone();
 
         #[cfg(feature = "journal")]
         {
