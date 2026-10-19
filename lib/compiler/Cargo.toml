@@ -84,6 +84,7 @@ enable-serde = ["serde", "serde_bytes", "wasmer-types/enable-serde"]
 artifact-size = ["dep:loupe"]
 # Signal-free trap-handler backend; see wasmer-vm's baremetal feature for details.
 baremetal = ["wasmer-vm/baremetal"]
+experimental-host-interrupt = ["wasmer-vm/experimental-host-interrupt"]
 
 [badges]
 maintenance = { status = "experimental" }

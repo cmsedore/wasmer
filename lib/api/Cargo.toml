@@ -140,7 +140,7 @@ experimental-async = ["dep:futures", "dep:corosensei"]
 unsafe-cothread = ["sys"]
 
 # Experimental host-triggered interruption support
-experimental-host-interrupt = ["wasmer-vm/experimental-host-interrupt"]
+experimental-host-interrupt = ["wasmer-vm/experimental-host-interrupt", "wasmer-compiler/experimental-host-interrupt"]
 
 # - Compilers.
 compiler = [

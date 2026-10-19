@@ -58,6 +58,9 @@ pub struct GlobalFrameInfoRegistration {
     /// The key that will be removed from the global `ranges` map when this is
     /// dropped.
     key: usize,
+    #[cfg(feature = "experimental-host-interrupt")]
+    #[cfg_attr(feature = "artifact-size", loupe(skip))]
+    _interrupt_code: wasmer_vm::interrupt_registry::CodeRegistration,
 }
 
 struct ModuleInfoFrameInfo {
@@ -505,5 +508,14 @@ pub(crate) fn register_with_source(
         },
     );
     assert!(prev.is_none());
-    Some(GlobalFrameInfoRegistration { key: max })
+    Some(GlobalFrameInfoRegistration {
+        key: max,
+        #[cfg(feature = "experimental-host-interrupt")]
+        _interrupt_code: wasmer_vm::interrupt_registry::CodeRegistration::new(
+            finished_functions.values().map(|extent| {
+                let start = *extent.ptr as usize;
+                (start, start + extent.length)
+            }),
+        ),
+    })
 }

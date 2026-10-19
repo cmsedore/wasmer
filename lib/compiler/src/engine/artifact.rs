@@ -1227,7 +1227,10 @@ impl Artifact {
             .elf_image
             .clone();
 
-        if frame_infos.is_some() || elf_image.is_some() {
+        if frame_infos.is_some()
+            || elf_image.is_some()
+            || cfg!(feature = "experimental-host-interrupt")
+        {
             let finished_function_extents = self
                 .allocated
                 .as_ref()

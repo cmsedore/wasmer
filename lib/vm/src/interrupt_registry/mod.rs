@@ -10,6 +10,10 @@
 use thiserror::Error;
 use wasmer_types::StoreId;
 
+mod code;
+pub use code::CodeRegistration;
+pub(crate) use code::is_guest_pc;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]

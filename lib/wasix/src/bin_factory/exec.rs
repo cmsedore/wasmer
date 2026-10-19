@@ -360,6 +360,22 @@ fn call_module(
         };
     };
 
+    // SIGKILL can win through a native interrupt, a queued guest signal, or
+    // disabled shared-memory atomics. All are cancellation of this process.
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    if ctx
+        .data(&store)
+        .process
+        .inner
+        .0
+        .lock()
+        .unwrap()
+        .execution
+        .is_cancelled()
+    {
+        call_ret = Err(RuntimeError::user(Box::new(WasiError::Exit(137i32.into()))));
+    }
+
     let ret = if let Err(err) = call_ret {
         match err.downcast::<WasiError>() {
             Ok(WasiError::Exit(code)) if code.is_success() => Ok(Errno::Success),

@@ -927,6 +927,12 @@ impl WasiProcess {
         // FIXME: this is wrong, threads might still be running!
         // Need special logic for the main thread.
         let guard = self.inner.0.lock().unwrap();
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        let exit_code = if guard.execution.is_cancelled() {
+            ExitCode::from(137)
+        } else {
+            exit_code
+        };
         for thread in guard.threads.values() {
             thread.set_status_finished(Ok(exit_code))
         }

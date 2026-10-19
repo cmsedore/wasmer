@@ -85,12 +85,24 @@ impl TokioTaskManager {
             .get();
         let max_threads = 200usize.max(concurrency * 100);
 
+        Self::with_worker_limits(rt, max_threads, max_threads)
+    }
+
+    /// Bound the native worker pool for embedders running many short guest jobs.
+    /// Idle core workers persist; workers above the core size retire after the
+    /// pool's keep-alive interval.
+    pub fn with_worker_limits<I>(rt: I, core_threads: usize, max_threads: usize) -> Self
+    where
+        I: Into<RuntimeOrHandle>,
+    {
+        assert!(core_threads > 0 && max_threads >= core_threads);
+
         Self {
             rt: rt.into(),
             pool: Arc::new(ThreadPool {
                 inner: rusty_pool::Builder::new()
                     .name("TokioTaskManager Thread Pool".to_string())
-                    .core_size(max_threads)
+                    .core_size(core_threads)
                     .max_size(max_threads)
                     .build(),
             }),

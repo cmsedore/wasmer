@@ -319,6 +319,7 @@ impl WasiThread {
         let default_exitcode: ExitCode = match sig {
             Signal::Sigquit => Errno::Success.into(),
             // Match the POSIX shell convention for signal termination.
+            Signal::Sigkill => ExitCode::from(128 + sig as i32),
             Signal::Sigabrt => ExitCode::from(128 + sig as i32),
             Signal::Sigpipe => Errno::Pipe.into(),
             _ => Errno::Intr.into(),

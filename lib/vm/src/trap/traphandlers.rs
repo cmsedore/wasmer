@@ -1021,6 +1021,13 @@ impl<T> TrapHandlerContextInner<T> {
                 return false;
             }
 
+            // Rust wrappers and runtime helpers also run briefly on the Wasm
+            // stack. Resetting their frames can strand locks and TLS borrows.
+            #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+            if trap_code == Some(TrapCode::HostInterrupt) && !interrupt_registry::is_guest_pc(pc) {
+                return false;
+            }
+
             let signal_trap = trap_code.or_else(|| {
                 maybe_fault_address.map(|addr| {
                     if self.coro_trap_handler.stack_ptr_in_bounds(addr) {
@@ -1037,7 +1044,10 @@ impl<T> TrapHandlerContextInner<T> {
             // read invalid memory addresses.
             //
             // See: https://github.com/rust-lang/backtrace-rs/pull/357
-            let backtrace = if signal_trap == Some(TrapCode::StackOverflow) {
+            let backtrace = if matches!(
+                signal_trap,
+                Some(TrapCode::StackOverflow | TrapCode::HostInterrupt)
+            ) {
                 Backtrace::from(vec![])
             } else {
                 Backtrace::new_unresolved()
@@ -1924,6 +1934,240 @@ mod tests {
         let _lock = GLOBAL_STATE.lock().unwrap();
         let n = on_host_stack(|| 99i32);
         assert_eq!(n, 99);
+    }
+
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    #[test]
+    fn host_interrupt_preserves_rust_cleanup_on_wasm_stack() {
+        use std::cell::RefCell;
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::Duration;
+        thread_local! {
+            static BORROW: RefCell<()> = const { RefCell::new(()) };
+        }
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        init_traps();
+        lazy_per_thread_init().unwrap();
+        let store = wasmer_types::StoreId::default();
+        let _guard = interrupt_registry::install(store).unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let child_ready = ready.clone();
+        let child_release = release.clone();
+        let sender = std::thread::spawn(move || {
+            while !child_ready.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            interrupt_registry::interrupt(store).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            child_release.store(true, Ordering::Release);
+        });
+        // Rust glue executes on this stack too. A forced coroutine reset here
+        // must not strand the borrow (or a TLS initializer / mutex guard).
+        let result = on_wasm_stack(get_stack_size(), None, move || {
+            BORROW.with(|cell| {
+                let _borrow = cell.borrow_mut();
+                ready.store(true, Ordering::Release);
+                while !release.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+            });
+        });
+        sender.join().unwrap();
+        assert!(
+            BORROW.with(|cell| cell.try_borrow_mut().is_ok()),
+            "interrupt abandoned a live Rust cleanup guard"
+        );
+        assert!(
+            result.is_ok(),
+            "Rust transition code must finish before trapping"
+        );
+        assert!(
+            interrupt_registry::is_interrupted(store),
+            "request must remain sticky"
+        );
+        clear_tls_stack();
+        drain_stack_pool();
+    }
+
+
+    // Run in a subprocess: the unpatched implementation aborts in libstd.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "experimental-host-interrupt"))]
+    #[test]
+    #[ignore = "requires fixtures/tls_alloc_pause.c via DYLD_INSERT_LIBRARIES"]
+    fn host_interrupt_tls_destructor_registration() {
+        use std::{sync::mpsc, time::{Duration, Instant}};
+        struct Dtor;
+        impl Drop for Dtor { fn drop(&mut self) {} }
+        thread_local! {
+            static TLS0: Dtor = const { Dtor };
+            static TLS1: Dtor = const { Dtor };
+            static TLS2: Dtor = const { Dtor };
+            static TLS3: Dtor = const { Dtor };
+            static TLS4: Dtor = const { Dtor };
+            static TLS5: Dtor = const { Dtor };
+            static TLS6: Dtor = const { Dtor };
+            static TLS7: Dtor = const { Dtor };
+            static TLS8: Dtor = const { Dtor };
+            static TLS9: Dtor = const { Dtor };
+            static TLS10: Dtor = const { Dtor };
+            static TLS11: Dtor = const { Dtor };
+            static TLS12: Dtor = const { Dtor };
+            static TLS13: Dtor = const { Dtor };
+            static TLS14: Dtor = const { Dtor };
+            static TLS15: Dtor = const { Dtor };
+            static TLS16: Dtor = const { Dtor };
+            static TLS17: Dtor = const { Dtor };
+            static TLS18: Dtor = const { Dtor };
+            static TLS19: Dtor = const { Dtor };
+            static TLS20: Dtor = const { Dtor };
+            static TLS21: Dtor = const { Dtor };
+            static TLS22: Dtor = const { Dtor };
+            static TLS23: Dtor = const { Dtor };
+            static TLS24: Dtor = const { Dtor };
+            static TLS25: Dtor = const { Dtor };
+            static TLS26: Dtor = const { Dtor };
+            static TLS27: Dtor = const { Dtor };
+            static TLS28: Dtor = const { Dtor };
+            static TLS29: Dtor = const { Dtor };
+            static TLS30: Dtor = const { Dtor };
+            static TLS31: Dtor = const { Dtor };
+            static TLS32: Dtor = const { Dtor };
+            static TLS33: Dtor = const { Dtor };
+            static TLS34: Dtor = const { Dtor };
+            static TLS35: Dtor = const { Dtor };
+            static TLS36: Dtor = const { Dtor };
+            static TLS37: Dtor = const { Dtor };
+            static TLS38: Dtor = const { Dtor };
+            static TLS39: Dtor = const { Dtor };
+            static TLS40: Dtor = const { Dtor };
+            static TLS41: Dtor = const { Dtor };
+            static TLS42: Dtor = const { Dtor };
+            static TLS43: Dtor = const { Dtor };
+            static TLS44: Dtor = const { Dtor };
+            static TLS45: Dtor = const { Dtor };
+            static TLS46: Dtor = const { Dtor };
+            static TLS47: Dtor = const { Dtor };
+            static TLS48: Dtor = const { Dtor };
+            static TLS49: Dtor = const { Dtor };
+            static TLS50: Dtor = const { Dtor };
+            static TLS51: Dtor = const { Dtor };
+            static TLS52: Dtor = const { Dtor };
+            static TLS53: Dtor = const { Dtor };
+            static TLS54: Dtor = const { Dtor };
+            static TLS55: Dtor = const { Dtor };
+            static TLS56: Dtor = const { Dtor };
+            static TLS57: Dtor = const { Dtor };
+            static TLS58: Dtor = const { Dtor };
+            static TLS59: Dtor = const { Dtor };
+            static TLS60: Dtor = const { Dtor };
+            static TLS61: Dtor = const { Dtor };
+            static TLS62: Dtor = const { Dtor };
+            static TLS63: Dtor = const { Dtor };
+            static FRESH: Dtor = const { Dtor };
+        }
+        unsafe fn symbol(name: &'static core::ffi::CStr) -> *mut libc::c_void {
+            let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+            assert!(!ptr.is_null(), "load the test-only malloc interposer");
+            ptr
+        }
+        let arm: unsafe extern "C" fn() = unsafe { std::mem::transmute(symbol(c"probe_tls_arm")) };
+        let ready: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(symbol(c"probe_tls_ready")) };
+        let release: unsafe extern "C" fn() = unsafe { std::mem::transmute(symbol(c"probe_tls_release")) };
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        init_traps();
+        lazy_per_thread_init().unwrap();
+        let store = wasmer_types::StoreId::default();
+        let _guard = interrupt_registry::install(store).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while unsafe { ready() } == 0 {
+                if Instant::now() > deadline { std::process::abort(); }
+                std::thread::yield_now();
+            }
+            interrupt_registry::interrupt(store).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            unsafe { release(); }
+            done_tx.send(()).unwrap();
+        });
+        let result = on_wasm_stack(get_stack_size(), None, move || {
+            unsafe { arm(); }
+                TLS0.with(|_| ());
+                TLS1.with(|_| ());
+                TLS2.with(|_| ());
+                TLS3.with(|_| ());
+                TLS4.with(|_| ());
+                TLS5.with(|_| ());
+                TLS6.with(|_| ());
+                TLS7.with(|_| ());
+                TLS8.with(|_| ());
+                TLS9.with(|_| ());
+                TLS10.with(|_| ());
+                TLS11.with(|_| ());
+                TLS12.with(|_| ());
+                TLS13.with(|_| ());
+                TLS14.with(|_| ());
+                TLS15.with(|_| ());
+                TLS16.with(|_| ());
+                TLS17.with(|_| ());
+                TLS18.with(|_| ());
+                TLS19.with(|_| ());
+                TLS20.with(|_| ());
+                TLS21.with(|_| ());
+                TLS22.with(|_| ());
+                TLS23.with(|_| ());
+                TLS24.with(|_| ());
+                TLS25.with(|_| ());
+                TLS26.with(|_| ());
+                TLS27.with(|_| ());
+                TLS28.with(|_| ());
+                TLS29.with(|_| ());
+                TLS30.with(|_| ());
+                TLS31.with(|_| ());
+                TLS32.with(|_| ());
+                TLS33.with(|_| ());
+                TLS34.with(|_| ());
+                TLS35.with(|_| ());
+                TLS36.with(|_| ());
+                TLS37.with(|_| ());
+                TLS38.with(|_| ());
+                TLS39.with(|_| ());
+                TLS40.with(|_| ());
+                TLS41.with(|_| ());
+                TLS42.with(|_| ());
+                TLS43.with(|_| ());
+                TLS44.with(|_| ());
+                TLS45.with(|_| ());
+                TLS46.with(|_| ());
+                TLS47.with(|_| ());
+                TLS48.with(|_| ());
+                TLS49.with(|_| ());
+                TLS50.with(|_| ());
+                TLS51.with(|_| ());
+                TLS52.with(|_| ());
+                TLS53.with(|_| ());
+                TLS54.with(|_| ());
+                TLS55.with(|_| ());
+                TLS56.with(|_| ());
+                TLS57.with(|_| ());
+                TLS58.with(|_| ());
+                TLS59.with(|_| ());
+                TLS60.with(|_| ());
+                TLS61.with(|_| ());
+                TLS62.with(|_| ());
+                TLS63.with(|_| ());
+        });
+        done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        sender.join().unwrap();
+        eprintln!("allocation_resume_completed={} now_register_fresh_tls", result.is_ok());
+        // On the original runtime this invokes libstd's real abort, with its
+        // exact fatal diagnostic, because DTORS still has an exclusive borrow.
+        FRESH.with(|_| ());
+        assert!(result.is_ok());
+        assert!(interrupt_registry::is_interrupted(store));
+        clear_tls_stack();
+        drain_stack_pool();
     }
 
     #[test]

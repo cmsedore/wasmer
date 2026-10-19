@@ -44,6 +44,10 @@ impl ProcessExecution {
         !self.state.lock().unwrap().active.is_empty()
     }
 
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state.lock().unwrap().cancelled
+    }
+
     pub(crate) fn enter(self: &Arc<Self>, interrupter: Interrupter) -> Option<ExecutionGuard> {
         let mut state = self.state.lock().unwrap();
         if state.cancelled {
@@ -52,7 +56,7 @@ impl ProcessExecution {
         let id = state.next;
         state.next += 1;
         state.active.insert(id, interrupter);
-        tracing::debug!(pid = %self.pid, id, active = state.active.len(), "execution-enter");
+        tracing::debug!(pid = %self.pid, id, active = state.active.len(), native_thread = ?std::thread::current().id(), "execution-enter");
         Some(ExecutionGuard {
             execution: self.clone(),
             id,
@@ -120,7 +124,7 @@ impl Drop for ExecutionGuard {
     fn drop(&mut self) {
         let mut state = self.execution.state.lock().unwrap();
         state.active.remove(&self.id);
-        tracing::debug!(pid = %self.execution.pid, id = self.id, active = state.active.len(), "execution-return");
+        tracing::debug!(pid = %self.execution.pid, id = self.id, active = state.active.len(), native_thread = ?std::thread::current().id(), "execution-return");
         self.execution.acknowledge_if_empty(&mut state);
     }
 }
