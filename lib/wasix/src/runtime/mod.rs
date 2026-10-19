@@ -384,6 +384,12 @@ where
         }
     }
 
+    /// Experimental embedding policy: guest code reaches signal safepoints.
+    /// Catchable signals must not publish an exit before running the callback.
+    fn signal_safepoints(&self) -> bool {
+        false
+    }
+
     /// Create additional imports for a new WASIX instance in the provided store.
     ///
     /// This callback may be invoked multiple times (e.g. process bootstrap,
@@ -1111,6 +1117,10 @@ impl OverriddenRuntime {
 }
 
 impl Runtime for OverriddenRuntime {
+    fn signal_safepoints(&self) -> bool {
+        self.inner.signal_safepoints()
+    }
+
     fn networking(&self) -> &DynVirtualNetworking {
         if let Some(net) = self.networking.as_ref() {
             net

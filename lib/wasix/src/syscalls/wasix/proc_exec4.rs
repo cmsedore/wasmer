@@ -295,6 +295,14 @@ pub(crate) fn proc_exec4_impl<M: MemorySize>(
 
         match process {
             Ok(mut process) => {
+                if ctx.data().runtime().signal_safepoints() {
+                    // The old exec image shares the guest thread's queue with
+                    // its replacement. It must not consume that image's signals
+                    // or invoke the obsolete image's callback while waiting.
+                    let code =
+                        block_on(process.wait_finished()).unwrap_or_else(|_| Errno::Child.into());
+                    return Err(WasiError::Exit(code));
+                }
                 // If we support deep sleeping then we switch to deep sleep mode
                 let env = ctx.data();
 

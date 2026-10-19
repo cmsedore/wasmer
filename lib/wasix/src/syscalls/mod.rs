@@ -399,10 +399,11 @@ where
                     .0
                     .iter()
                     .filter_map(|sig| {
-                        if *sig == Signal::Sigint
-                            || *sig == Signal::Sigquit
-                            || *sig == Signal::Sigkill
-                            || *sig == Signal::Sigabrt
+                        if *sig == Signal::Sigkill
+                            || (!env.runtime().signal_safepoints()
+                                && (*sig == Signal::Sigint
+                                    || *sig == Signal::Sigquit
+                                    || *sig == Signal::Sigabrt))
                         {
                             Some(env.thread.set_or_get_exit_code_for_signal(*sig))
                         } else {

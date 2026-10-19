@@ -725,7 +725,11 @@ impl WasiEnv {
                         || sig == Signal::Sigabrt
                         || sig == Signal::Sigpipe
                     {
-                        let exit_code = env.thread.set_or_get_exit_code_for_signal(sig);
+                        let exit_code = if env.runtime().signal_safepoints() {
+                            ExitCode::from(128 + sig as i32)
+                        } else {
+                            env.thread.set_or_get_exit_code_for_signal(sig)
+                        };
                         return Err(WasiError::Exit(exit_code));
                     } else {
                         tracing::trace!(pid=%env.pid(), ?sig, "Signal ignored");

@@ -135,6 +135,13 @@ pub fn spawn_exec_module(
     let pid = env.pid();
 
     let join_handle = env.thread.join_handle();
+    if runtime.signal_safepoints() {
+        // Callback registration belongs to an executable image. An exec from
+        // Bash into a WASIp1 program must not inherit Bash's registration flag.
+        env.state
+            .signal_handler_registered
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
     {
         // Create a thread that will run this process
         let tasks_outer = tasks.clone();

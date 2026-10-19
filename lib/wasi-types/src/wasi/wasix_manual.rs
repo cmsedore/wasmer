@@ -212,10 +212,26 @@ unsafe impl ValueType for StackSnapshot {
 #[derive(Clone, Copy)]
 pub union JoinStatusUnion {
     pub nothing: u8,
-    pub exit_normal: Errno,
+    // The ABI slot is a 16-bit integer, not a validated Errno discriminant.
+    // Exit statuses such as 130/255 must survive the guest wait boundary.
+    pub exit_normal: u16,
     pub exit_signal: ErrnoSignal,
     pub stopped: Signal,
 }
+#[test]
+fn join_status_preserves_exit_codes_and_wire_layout() {
+    assert_eq!(std::mem::size_of::<JoinStatus>(), 6);
+    assert_eq!(std::mem::align_of::<JoinStatus>(), 2);
+    assert_eq!(std::mem::offset_of!(JoinStatus, u), 2);
+    for code in [0u16, 42, 79, 130, 134, 255] {
+        let status = JoinStatus {
+            tag: JoinStatusType::ExitNormal,
+            u: JoinStatusUnion { exit_normal: code },
+        };
+        assert_eq!(unsafe { status.u.exit_normal }, code);
+    }
+}
+
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct JoinStatus {
