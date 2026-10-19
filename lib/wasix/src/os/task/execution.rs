@@ -13,8 +13,8 @@ use wasmer_wasix_types::types::Signal;
 use wasmer_wasix_types::wasi::ExitCode;
 
 struct ActiveStore {
-    interrupter: Interrupter,
-    worker: std::thread::ThreadId,
+    interrupter: Option<Interrupter>,
+    worker: Option<std::thread::ThreadId>,
 }
 
 #[derive(Default)]
@@ -30,6 +30,7 @@ struct State {
     parked: BTreeSet<u64>,
     quiescent: BTreeSet<u64>,
     stop_waiters: Vec<Waker>,
+    async_waiters: Vec<Waker>,
 }
 
 pub(crate) struct ProcessExecution {
@@ -101,8 +102,8 @@ impl ProcessExecution {
         state.active.insert(
             id,
             ActiveStore {
-                interrupter,
-                worker: std::thread::current().id(),
+                interrupter: Some(interrupter),
+                worker: Some(std::thread::current().id()),
             },
         );
         tracing::debug!(pid = %self.pid, id, active = state.active.len(), native_thread = ?std::thread::current().id(), "execution-enter");
@@ -110,6 +111,57 @@ impl ProcessExecution {
             execution: self.clone(),
             id,
         })
+    }
+
+    pub(crate) fn enter_async(self: &Arc<Self>) -> Option<ExecutionGuard> {
+        let mut state = self.state.lock().unwrap();
+        if state.cancelled {
+            return None;
+        }
+        let id = state.next;
+        state.next += 1;
+        state.active.insert(
+            id,
+            ActiveStore {
+                interrupter: None,
+                worker: None,
+            },
+        );
+        Some(ExecutionGuard {
+            execution: self.clone(),
+            id,
+        })
+    }
+
+    pub(crate) fn poll_async(&self, id: u64, cx: &mut Context<'_>) -> Poll<Result<(), ExitCode>> {
+        let mut state = self.state.lock().unwrap();
+        if !state.async_waiters.iter().any(|w| w.will_wake(cx.waker())) {
+            state.async_waiters.push(cx.waker().clone());
+        }
+        if state.cancelled {
+            return Poll::Ready(Err(137i32.into()));
+        }
+        if state.stopped.is_none() {
+            return Poll::Ready(Ok(()));
+        }
+        state.parked.insert(id);
+        let notify = Self::all_execution_parked(&state) && !state.stop_notified;
+        let waiters = if notify {
+            state.stop_notified = true;
+            std::mem::take(&mut state.stop_waiters)
+        } else {
+            vec![]
+        };
+        drop(state);
+        for waiter in waiters {
+            waiter.wake();
+        }
+        if notify {
+            if let Some(plane) = self.control_plane.as_ref().and_then(|p| p.upgrade()) {
+                plane.notify_parent_child_event(self.pid);
+            }
+        }
+        Poll::Pending
     }
 
     fn acknowledge_if_empty(&self, state: &mut State) -> bool {
@@ -133,7 +185,7 @@ impl ProcessExecution {
     }
 
     pub(crate) fn cancel(self: &Arc<Self>) {
-        let acknowledged = {
+        let (acknowledged, waiters) = {
             let mut state = self.state.lock().unwrap();
             if state.cancelled {
                 return;
@@ -143,9 +195,13 @@ impl ProcessExecution {
             state.parked.clear();
             self.resumed.notify_all();
             state.cancelled_at = Some(Instant::now());
+            let waiters = std::mem::take(&mut state.async_waiters);
             tracing::debug!(pid = %self.pid, active = state.active.len(), "forced-interrupt-request");
-            self.acknowledge_if_empty(&mut state)
+            (self.acknowledge_if_empty(&mut state), waiters)
         };
+        for waiter in waiters {
+            waiter.wake();
+        }
         if acknowledged {
             self.finish_cancelled();
         }
@@ -162,7 +218,7 @@ impl ProcessExecution {
                     .unwrap()
                     .active
                     .values()
-                    .map(|store| store.interrupter.clone())
+                    .filter_map(|store| store.interrupter.clone())
                     .collect::<Vec<_>>();
                 if handles.is_empty() {
                     tracing::debug!(pid = %execution.pid, "interrupt-worker-return");
@@ -188,6 +244,11 @@ impl ProcessExecution {
             state.stop_notified = false;
             state.parked.clear();
             tracing::debug!(pid = %self.pid, ?signal, active = state.active.len(), "process-stop-request");
+            let waiters = std::mem::take(&mut state.async_waiters);
+            drop(state);
+            for waiter in waiters {
+                waiter.wake();
+            }
         }
     }
 
@@ -197,6 +258,11 @@ impl ProcessExecution {
         state.parked.clear();
         self.resumed.notify_all();
         tracing::debug!(pid = %self.pid, "process-continue");
+        let waiters = std::mem::take(&mut state.async_waiters);
+        drop(state);
+        for waiter in waiters {
+            waiter.wake();
+        }
     }
 
     /// Park an active Store at a normal host import, preserving its guest stack.
@@ -207,7 +273,7 @@ impl ProcessExecution {
             let matching: Vec<u64> = state
                 .active
                 .iter()
-                .filter_map(|(&id, store)| (store.worker == worker).then_some(id))
+                .filter_map(|(&id, store)| (store.worker == Some(worker)).then_some(id))
                 .collect();
             for id in matching {
                 state.parked.insert(id);
@@ -259,7 +325,7 @@ impl ProcessExecution {
         let ids = state
             .active
             .iter()
-            .filter_map(|(&id, store)| (store.worker == worker).then_some(id))
+            .filter_map(|(&id, store)| (store.worker == Some(worker)).then_some(id))
             .collect::<Vec<_>>();
         state.quiescent.extend(ids.iter().copied());
         let notify =
@@ -305,6 +371,26 @@ pub(crate) struct ExecutionGuard {
     id: u64,
 }
 
+impl ExecutionGuard {
+    pub(crate) fn poll_permitted(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExitCode>> {
+        self.execution.poll_async(self.id, cx)
+    }
+
+    pub(crate) fn commit_if_permitted<T>(
+        &self,
+        commit: impl FnOnce() -> T,
+    ) -> Result<Option<T>, ExitCode> {
+        let state = self.execution.state.lock().unwrap();
+        if state.cancelled {
+            return Err(137i32.into());
+        }
+        if state.stopped.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(commit()))
+    }
+}
+
 impl Drop for ExecutionGuard {
     fn drop(&mut self) {
         let mut state = self.execution.state.lock().unwrap();
@@ -345,6 +431,32 @@ impl Drop for ExecutionGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_stop_requires_all_threads_and_cancellation_blocks_commit() {
+        let process = Arc::new(ProcessExecution::new(9u32.into()));
+        let first = process.enter_async().unwrap();
+        let second = process.enter_async().unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        process.stop(Signal::Sigstop);
+        assert!(first.poll_permitted(&mut cx).is_pending());
+        assert_eq!(process.try_take_stop(), None);
+        assert!(second.poll_permitted(&mut cx).is_pending());
+        assert_eq!(process.try_take_stop(), Some(Signal::Sigstop));
+        assert_eq!(first.commit_if_permitted(|| 17).unwrap(), None);
+        process.resume();
+        assert!(first.poll_permitted(&mut cx).is_ready());
+        assert_eq!(first.commit_if_permitted(|| 17).unwrap(), Some(17));
+        process.cancel();
+        assert!(
+            first
+                .commit_if_permitted(|| panic!("commit after kill"))
+                .is_err()
+        );
+        drop(first);
+        drop(second);
+        assert!(process.state.lock().unwrap().acknowledged);
+    }
 
     #[test]
     fn cancellation_is_sticky_before_first_execution() {

@@ -42,6 +42,31 @@ use super::{
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WasiProcessId(u32);
 
+/// An async execution owns a guest stack but no native worker while waiting.
+#[cfg(all(unix, feature = "experimental-host-interrupt"))]
+pub struct AsyncExecution(super::execution::ExecutionGuard);
+
+#[cfg(all(unix, feature = "experimental-host-interrupt"))]
+impl AsyncExecution {
+    /// Commit a bounded host-memory operation atomically with respect to stop/kill.
+    /// The closure must not block, await, or call guest code.
+    pub fn commit_if_permitted<T>(&self, commit: impl FnOnce() -> T)
+        -> Result<Option<T>, ExitCode> {
+        self.0.commit_if_permitted(commit)
+    }
+    pub fn poll_permitted(&self, cx: &mut std::task::Context<'_>)
+        -> std::task::Poll<Result<(), ExitCode>> {
+        self.0.poll_permitted(cx)
+    }
+}
+
+#[cfg(all(unix, feature = "experimental-host-interrupt"))]
+impl WasiProcess {
+    pub fn begin_async_execution(&self) -> Option<AsyncExecution> {
+        self.inner.0.lock().unwrap().execution.enter_async().map(AsyncExecution)
+    }
+}
+
 impl WasiProcessId {
     pub fn raw(&self) -> u32 {
         self.0

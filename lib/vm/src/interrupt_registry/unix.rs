@@ -118,6 +118,68 @@ pub fn install(store_id: StoreId) -> Result<InterruptInstallGuard, InstallError>
     Ok(InterruptInstallGuard { store_id })
 }
 
+/// Detach this coroutine's interrupt stack while it awaits a host future.
+/// Store entries remain registered so pending interrupts are not lost. This
+/// guard also restores the stack during forced coroutine unwinding.
+pub struct SuspendedInterruptStack(
+    Option<Vec<StoreId>>,
+    std::marker::PhantomData<std::rc::Rc<()>>,
+);
+
+/// Suspend interrupt installations until the returned guard is dropped.
+pub fn suspend_current() -> SuspendedInterruptStack {
+    let stores = THREAD_INTERRUPT_STATE.with(|t| {
+        let state = unsafe { &mut *t.get() };
+        state.current_active_store.store(0, Ordering::Release);
+        std::mem::take(&mut state.active_stores)
+    });
+    SuspendedInterruptStack(Some(stores), std::marker::PhantomData)
+}
+
+#[cfg(test)]
+mod async_scope_tests {
+    use super::*;
+
+    #[test]
+    fn suspended_coroutines_can_finish_in_either_order() {
+        let a = StoreId::default();
+        let b = StoreId::default();
+        let install_a = install(a).unwrap();
+        let suspend_a = suspend_current();
+        let install_b = install(b).unwrap();
+        let suspend_b = suspend_current();
+        drop(suspend_a);
+        drop(install_a);
+        assert!(!STORE_INTERRUPT_STATE.contains_key(&a));
+        assert!(STORE_INTERRUPT_STATE.contains_key(&b));
+        drop(suspend_b);
+        drop(install_b);
+        THREAD_INTERRUPT_STATE.with(|t| {
+            let state = unsafe { &*t.get() };
+            assert!(state.active_stores.is_empty());
+            assert_eq!(state.current_active_store.load(Ordering::Acquire), 0);
+        });
+    }
+}
+
+impl Drop for SuspendedInterruptStack {
+    fn drop(&mut self) {
+        let stores = self.0.take().unwrap();
+        THREAD_INTERRUPT_STATE.with(|t| {
+            let state = unsafe { &mut *t.get() };
+            assert!(
+                state.active_stores.is_empty(),
+                "resuming a coroutine inside another active store"
+            );
+            state.current_active_store.store(
+                stores.last().map_or(0, |s| s.as_raw().get()),
+                Ordering::Release,
+            );
+            state.active_stores = stores;
+        });
+    }
+}
+
 pub(super) fn uninstall(store_id: StoreId) {
     let Entry::Occupied(store_state_entry) = STORE_INTERRUPT_STATE.entry(store_id) else {
         panic!("Internal error: interrupt state not installed for store");

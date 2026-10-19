@@ -578,6 +578,7 @@ impl crate::runners::Runner for WasiRunner {
 
 fn wasi_runtime_error_to_owned(err: &WasiRuntimeError) -> WasiRuntimeError {
     match err {
+        WasiRuntimeError::Wasi(WasiError::ExecReplaced) => WasiRuntimeError::Wasi(WasiError::ExecReplaced),
         WasiRuntimeError::Init(a) => WasiRuntimeError::Init(a.clone()),
         WasiRuntimeError::Export(a) => WasiRuntimeError::Export(a.clone()),
         WasiRuntimeError::Instantiation(a) => WasiRuntimeError::Instantiation(a.clone()),

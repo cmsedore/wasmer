@@ -362,10 +362,20 @@ impl CoroutineContext {
         self.leave();
 
         let yielder = unsafe { self.yielder.as_ref().expect("yielder pointer valid") };
+        // Neither trap routing nor interrupt installations may remain in TLS
+        // while another coroutine runs on this native thread.
+        #[cfg(not(feature = "baremetal"))]
+        let trap_context = unsafe { super::vm::suspend_trap_context() };
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        let interrupt_stack = super::vm::interrupt_registry::suspend_current();
         let result = match yielder.suspend(AsyncYield(future)) {
             AsyncResume::HostFutureReady(result) => result,
             AsyncResume::Start => unreachable!("coroutine resumed without start"),
         };
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        drop(interrupt_stack);
+        #[cfg(not(feature = "baremetal"))]
+        drop(trap_context);
 
         // Once the future is ready, we restore the current coroutine
         // context.

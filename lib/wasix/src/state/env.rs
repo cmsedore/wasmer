@@ -653,6 +653,34 @@ impl WasiEnv {
         self.runtime.deref()
     }
 
+    /// Detach a read into an owned buffer; no guest-memory borrow crosses await.
+    /// The returned future owns only a cloned, rights-checked pipe endpoint.
+    pub fn owned_pipe_read(&self, fd: u32, capacity: usize)
+        -> Result<BoxFuture<'static, Result<Vec<u8>, Errno>>, Errno> {
+        use crate::fs::Kind;
+        use wasmer_wasix_types::wasi::{Fdflags, Rights};
+        let entry = self.state.fs.get_fd(fd)?;
+        if !entry.is_stdio && !entry.inner.rights.contains(Rights::FD_READ) {
+            return Err(Errno::Access);
+        }
+        if capacity > 1024 * 1024 { return Err(Errno::Inval); }
+        let nonblocking = entry.inner.flags.contains(Fdflags::NONBLOCK);
+        let mut rx = match &*entry.inode.read() {
+            Kind::PipeRx { rx } => rx.clone(),
+            _ => return Err(Errno::Notsup),
+        };
+        Ok(Box::pin(async move {
+            let mut bytes = vec![0; capacity];
+            let read = if capacity == 0 { 0 } else if nonblocking {
+                rx.try_read(&mut bytes).ok_or(Errno::Again)?
+            } else {
+                virtual_fs::AsyncReadExt::read(&mut rx, &mut bytes).await?
+            };
+            bytes.truncate(read);
+            Ok(bytes)
+        }))
+    }
+
     /// Returns a copy of the current tasks implementation for this environment
     pub fn tasks(&self) -> &Arc<dyn VirtualTaskManager> {
         self.runtime.task_manager()

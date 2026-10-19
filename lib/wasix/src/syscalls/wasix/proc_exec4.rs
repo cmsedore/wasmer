@@ -83,6 +83,9 @@ pub(crate) fn proc_exec4_impl<M: MemorySize>(
     search_path: Bool,
     path: Option<&str>,
 ) -> Result<Errno, WasiError> {
+    if ctx.data().runtime().detached_exec_images() && ctx.data().process.active_threads() > 1 {
+        return Ok(Errno::Notsup);
+    }
     // Convert relative paths into absolute paths
     if search_path == Bool::True && !name.contains('/') {
         let path = if let Some(path) = path {
@@ -295,6 +298,9 @@ pub(crate) fn proc_exec4_impl<M: MemorySize>(
 
         match process {
             Ok(mut process) => {
+                if ctx.data().runtime().detached_exec_images() {
+                    return Err(WasiError::ExecReplaced);
+                }
                 if ctx.data().runtime().signal_safepoints() {
                     // The old exec image shares the guest thread's queue with
                     // its replacement. It must not consume that image's signals

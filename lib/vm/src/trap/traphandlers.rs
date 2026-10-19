@@ -899,6 +899,31 @@ thread_local! {
     static TRAP_HANDLER: AtomicPtr<TrapHandlerContext> = const { AtomicPtr::new(ptr::null_mut()) };
 }
 
+/// Restores a suspended coroutine's thread-local trap routing on drop.
+pub struct SuspendedTrapContext {
+    yielder: Option<NonNull<Yielder<(), UnwindReason>>>,
+    handler: *mut TrapHandlerContext,
+}
+
+/// Detach trap routing while an async coroutine is inactive.
+///
+/// # Safety
+/// The current coroutine's stack frames must remain alive, and the guard must
+/// be dropped on this thread immediately before that coroutine resumes or unwinds.
+pub unsafe fn suspend_trap_context() -> SuspendedTrapContext {
+    SuspendedTrapContext {
+        yielder: YIELDER.with(|cell| cell.replace(None)),
+        handler: TRAP_HANDLER.with(|cell| cell.swap(ptr::null_mut(), Ordering::SeqCst)),
+    }
+}
+
+impl Drop for SuspendedTrapContext {
+    fn drop(&mut self) {
+        YIELDER.with(|cell| cell.set(self.yielder));
+        TRAP_HANDLER.with(|cell| cell.store(self.handler, Ordering::SeqCst));
+    }
+}
+
 /// Read-only information that is used by signal handlers to handle and recover
 /// from traps.
 #[allow(clippy::type_complexity)]
@@ -1990,15 +2015,23 @@ mod tests {
         drain_stack_pool();
     }
 
-
     // Run in a subprocess: the unpatched implementation aborts in libstd.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "experimental-host-interrupt"))]
+    #[cfg(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        feature = "experimental-host-interrupt"
+    ))]
     #[test]
     #[ignore = "requires fixtures/tls_alloc_pause.c via DYLD_INSERT_LIBRARIES"]
     fn host_interrupt_tls_destructor_registration() {
-        use std::{sync::mpsc, time::{Duration, Instant}};
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
         struct Dtor;
-        impl Drop for Dtor { fn drop(&mut self) {} }
+        impl Drop for Dtor {
+            fn drop(&mut self) {}
+        }
         thread_local! {
             static TLS0: Dtor = const { Dtor };
             static TLS1: Dtor = const { Dtor };
@@ -2072,8 +2105,10 @@ mod tests {
             ptr
         }
         let arm: unsafe extern "C" fn() = unsafe { std::mem::transmute(symbol(c"probe_tls_arm")) };
-        let ready: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(symbol(c"probe_tls_ready")) };
-        let release: unsafe extern "C" fn() = unsafe { std::mem::transmute(symbol(c"probe_tls_release")) };
+        let ready: unsafe extern "C" fn() -> i32 =
+            unsafe { std::mem::transmute(symbol(c"probe_tls_ready")) };
+        let release: unsafe extern "C" fn() =
+            unsafe { std::mem::transmute(symbol(c"probe_tls_release")) };
         let _lock = GLOBAL_STATE.lock().unwrap();
         init_traps();
         lazy_per_thread_init().unwrap();
@@ -2083,84 +2118,93 @@ mod tests {
         let sender = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(3);
             while unsafe { ready() } == 0 {
-                if Instant::now() > deadline { std::process::abort(); }
+                if Instant::now() > deadline {
+                    std::process::abort();
+                }
                 std::thread::yield_now();
             }
             interrupt_registry::interrupt(store).unwrap();
             std::thread::sleep(Duration::from_millis(20));
-            unsafe { release(); }
+            unsafe {
+                release();
+            }
             done_tx.send(()).unwrap();
         });
         let result = on_wasm_stack(get_stack_size(), None, move || {
-            unsafe { arm(); }
-                TLS0.with(|_| ());
-                TLS1.with(|_| ());
-                TLS2.with(|_| ());
-                TLS3.with(|_| ());
-                TLS4.with(|_| ());
-                TLS5.with(|_| ());
-                TLS6.with(|_| ());
-                TLS7.with(|_| ());
-                TLS8.with(|_| ());
-                TLS9.with(|_| ());
-                TLS10.with(|_| ());
-                TLS11.with(|_| ());
-                TLS12.with(|_| ());
-                TLS13.with(|_| ());
-                TLS14.with(|_| ());
-                TLS15.with(|_| ());
-                TLS16.with(|_| ());
-                TLS17.with(|_| ());
-                TLS18.with(|_| ());
-                TLS19.with(|_| ());
-                TLS20.with(|_| ());
-                TLS21.with(|_| ());
-                TLS22.with(|_| ());
-                TLS23.with(|_| ());
-                TLS24.with(|_| ());
-                TLS25.with(|_| ());
-                TLS26.with(|_| ());
-                TLS27.with(|_| ());
-                TLS28.with(|_| ());
-                TLS29.with(|_| ());
-                TLS30.with(|_| ());
-                TLS31.with(|_| ());
-                TLS32.with(|_| ());
-                TLS33.with(|_| ());
-                TLS34.with(|_| ());
-                TLS35.with(|_| ());
-                TLS36.with(|_| ());
-                TLS37.with(|_| ());
-                TLS38.with(|_| ());
-                TLS39.with(|_| ());
-                TLS40.with(|_| ());
-                TLS41.with(|_| ());
-                TLS42.with(|_| ());
-                TLS43.with(|_| ());
-                TLS44.with(|_| ());
-                TLS45.with(|_| ());
-                TLS46.with(|_| ());
-                TLS47.with(|_| ());
-                TLS48.with(|_| ());
-                TLS49.with(|_| ());
-                TLS50.with(|_| ());
-                TLS51.with(|_| ());
-                TLS52.with(|_| ());
-                TLS53.with(|_| ());
-                TLS54.with(|_| ());
-                TLS55.with(|_| ());
-                TLS56.with(|_| ());
-                TLS57.with(|_| ());
-                TLS58.with(|_| ());
-                TLS59.with(|_| ());
-                TLS60.with(|_| ());
-                TLS61.with(|_| ());
-                TLS62.with(|_| ());
-                TLS63.with(|_| ());
+            unsafe {
+                arm();
+            }
+            TLS0.with(|_| ());
+            TLS1.with(|_| ());
+            TLS2.with(|_| ());
+            TLS3.with(|_| ());
+            TLS4.with(|_| ());
+            TLS5.with(|_| ());
+            TLS6.with(|_| ());
+            TLS7.with(|_| ());
+            TLS8.with(|_| ());
+            TLS9.with(|_| ());
+            TLS10.with(|_| ());
+            TLS11.with(|_| ());
+            TLS12.with(|_| ());
+            TLS13.with(|_| ());
+            TLS14.with(|_| ());
+            TLS15.with(|_| ());
+            TLS16.with(|_| ());
+            TLS17.with(|_| ());
+            TLS18.with(|_| ());
+            TLS19.with(|_| ());
+            TLS20.with(|_| ());
+            TLS21.with(|_| ());
+            TLS22.with(|_| ());
+            TLS23.with(|_| ());
+            TLS24.with(|_| ());
+            TLS25.with(|_| ());
+            TLS26.with(|_| ());
+            TLS27.with(|_| ());
+            TLS28.with(|_| ());
+            TLS29.with(|_| ());
+            TLS30.with(|_| ());
+            TLS31.with(|_| ());
+            TLS32.with(|_| ());
+            TLS33.with(|_| ());
+            TLS34.with(|_| ());
+            TLS35.with(|_| ());
+            TLS36.with(|_| ());
+            TLS37.with(|_| ());
+            TLS38.with(|_| ());
+            TLS39.with(|_| ());
+            TLS40.with(|_| ());
+            TLS41.with(|_| ());
+            TLS42.with(|_| ());
+            TLS43.with(|_| ());
+            TLS44.with(|_| ());
+            TLS45.with(|_| ());
+            TLS46.with(|_| ());
+            TLS47.with(|_| ());
+            TLS48.with(|_| ());
+            TLS49.with(|_| ());
+            TLS50.with(|_| ());
+            TLS51.with(|_| ());
+            TLS52.with(|_| ());
+            TLS53.with(|_| ());
+            TLS54.with(|_| ());
+            TLS55.with(|_| ());
+            TLS56.with(|_| ());
+            TLS57.with(|_| ());
+            TLS58.with(|_| ());
+            TLS59.with(|_| ());
+            TLS60.with(|_| ());
+            TLS61.with(|_| ());
+            TLS62.with(|_| ());
+            TLS63.with(|_| ());
         });
         done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         sender.join().unwrap();
-        eprintln!("allocation_resume_completed={} now_register_fresh_tls", result.is_ok());
+        eprintln!(
+            "allocation_resume_completed={} now_register_fresh_tls",
+            result.is_ok()
+        );
         // On the original runtime this invokes libstd's real abort, with its
         // exact fatal diagnostic, because DTORS still has an exclusive borrow.
         FRESH.with(|_| ());

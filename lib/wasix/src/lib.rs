@@ -130,6 +130,8 @@ pub use crate::{
 /// Use `downcast` or `downcast_ref` to retrieve the `ExitCode`.
 #[derive(Error, Debug)]
 pub enum WasiError {
+    #[error("Execution transferred to the replacement image")]
+    ExecReplaced,
     #[error("WASI exited with code: {0}")]
     Exit(ExitCode),
     #[error("WASI thread exited")]

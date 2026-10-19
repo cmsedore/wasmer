@@ -378,6 +378,13 @@ fn call_module(
 
     let ret = if let Err(err) = call_ret {
         match err.downcast::<WasiError>() {
+            Ok(WasiError::ExecReplaced) => {
+                // The replacement owns this process/thread and its descriptors.
+                // Retiring the old image must neither finish it nor close its fds.
+                handle.disarm();
+                unsafe { run_recycle(recycle, ctx, store) };
+                return;
+            }
             Ok(WasiError::Exit(code)) if code.is_success() => Ok(Errno::Success),
             Ok(WasiError::ThreadExit) => Ok(Errno::Success),
             Ok(WasiError::Exit(code)) => {
@@ -471,7 +478,7 @@ fn resume_vfork(
         Ok(_) => (None, wasmer_wasix_types::wasi::ExitCode::from(0u16)),
         Err(err) => match err.downcast_ref::<WasiError>() {
             // If the child process is just deep sleeping, we don't restore the vfork
-            Some(WasiError::DeepSleep(..)) => return (store, Ok(None)),
+            Some(WasiError::DeepSleep(..) | WasiError::ExecReplaced) => return (store, Ok(None)),
 
             Some(WasiError::Exit(code)) => (None, *code),
             Some(WasiError::ThreadExit) => (None, wasmer_wasix_types::wasi::ExitCode::from(0u16)),

@@ -245,6 +245,7 @@ fn handle_thread_result(
         return Ok(None);
     };
     match err.downcast::<WasiError>() {
+        Ok(WasiError::ExecReplaced) => Ok(None),
         Ok(WasiError::ThreadExit) => {
             trace!("thread exited cleanly");
             Ok(None)

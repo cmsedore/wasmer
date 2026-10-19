@@ -269,6 +269,10 @@ fn run<M: MemorySize>(
     child_handle: WasiThreadHandle,
     rewind_state: Option<(RewindState, RewindResultType)>,
 ) -> ExitCode {
+    if ctx.data(&store).runtime().detached_exec_images() {
+        // Transfer the fork thread's ownership with an exec image.
+        ctx.data_mut(&mut store).owned_handles.push(child_handle.clone());
+    }
     let env = ctx.data(&store);
     let tasks = env.tasks().clone();
     let pid = env.pid();
@@ -316,6 +320,7 @@ fn run<M: MemorySize>(
     };
     if let Err(err) = err {
         match err.downcast::<WasiError>() {
+            Ok(WasiError::ExecReplaced) => return Errno::Success.into(),
             Ok(WasiError::Exit(exit_code)) => {
                 ret = exit_code;
             }

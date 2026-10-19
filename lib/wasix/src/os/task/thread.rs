@@ -193,16 +193,22 @@ impl WasiThread {
 /// this is forgotten or a panic occurs.
 pub struct WasiThreadRunGuard {
     pub thread: WasiThread,
+    armed: bool,
 }
 
 impl WasiThreadRunGuard {
     pub fn new(thread: WasiThread) -> Self {
-        Self { thread }
+        Self { thread, armed: true }
+    }
+
+    pub fn disarm(mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for WasiThreadRunGuard {
     fn drop(&mut self) {
+        if !self.armed { return; }
         self.thread
             .set_status_finished(Err(
                 crate::RuntimeError::new("Thread manager disconnected").into()

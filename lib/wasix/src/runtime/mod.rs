@@ -390,6 +390,11 @@ where
         false
     }
 
+    /// Opt-in ownership transfer: a successful exec retires its old image.
+    fn detached_exec_images(&self) -> bool {
+        false
+    }
+
     /// Create additional imports for a new WASIX instance in the provided store.
     ///
     /// This callback may be invoked multiple times (e.g. process bootstrap,
@@ -1117,6 +1122,9 @@ impl OverriddenRuntime {
 }
 
 impl Runtime for OverriddenRuntime {
+    fn detached_exec_images(&self) -> bool {
+        self.inner.detached_exec_images()
+    }
     fn signal_safepoints(&self) -> bool {
         self.inner.signal_safepoints()
     }

@@ -23,6 +23,8 @@ pub use traphandlers::{
     on_host_stack, raise_lib_trap, raise_user_trap, set_stack_size,
 };
 pub use traphandlers::{init_traps, resume_panic};
+#[cfg(not(feature = "baremetal"))]
+pub use traphandlers::{SuspendedTrapContext, suspend_trap_context};
 pub use wasmer_types::TrapCode;
 
 /// Call a Wasm trampoline.
