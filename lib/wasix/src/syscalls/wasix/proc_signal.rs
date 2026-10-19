@@ -14,12 +14,12 @@ pub fn proc_signal(
     pid: Pid,
     sig: Signal,
 ) -> Result<Errno, WasiError> {
-    let process = {
-        let pid: WasiProcessId = pid.into();
-        ctx.data().control_plane.get_process(pid)
-    };
-    if let Some(process) = process {
-        process.signal_process(sig);
+    let result =
+        ctx.data()
+            .control_plane
+            .signal_process_target(ctx.data().process.pid(), pid as i32, sig);
+    if let Err(err) = result {
+        return Ok(err);
     }
 
     WasiEnv::do_pending_operations(&mut ctx)?;

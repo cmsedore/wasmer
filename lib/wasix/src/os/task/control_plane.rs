@@ -9,6 +9,7 @@ use std::{
 
 use crate::{WasiProcess, WasiProcessId};
 use wasmer_types::ModuleHash;
+use wasmer_wasix_types::wasi::{Errno, Signal};
 
 #[derive(Debug, Clone)]
 pub struct WasiControlPlane {
@@ -83,7 +84,17 @@ struct MutableState {
     process_seed: u32,
     /// The processes running on this machine
     processes: HashMap<WasiProcessId, WasiProcess>,
+    groups: HashMap<WasiProcessId, ProcessGroupInfo>,
+    foreground_group: Option<u32>,
+    groups_enabled: bool,
     // TODO: keep a queue of terminated process ids for id reuse.
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessGroupInfo {
+    parent: Option<WasiProcessId>,
+    group: u32,
+    session: u32,
 }
 
 impl WasiControlPlane {
@@ -95,6 +106,9 @@ impl WasiControlPlane {
                 mutable: RwLock::new(MutableState {
                     process_seed: 0,
                     processes: Default::default(),
+                    groups: Default::default(),
+                    foreground_group: None,
+                    groups_enabled: false,
                 }),
             }),
         }
@@ -132,6 +146,22 @@ impl WasiControlPlane {
     // FIXME: De-register terminated processes!
     // Currently they just accumulate.
     pub fn new_process(&self, module_hash: ModuleHash) -> Result<WasiProcess, ControlPlaneError> {
+        self.new_process_inner(module_hash, None)
+    }
+
+    pub fn new_child_process(
+        &self,
+        module_hash: ModuleHash,
+        parent: WasiProcessId,
+    ) -> Result<WasiProcess, ControlPlaneError> {
+        self.new_process_inner(module_hash, Some(parent))
+    }
+
+    fn new_process_inner(
+        &self,
+        module_hash: ModuleHash,
+        parent: Option<WasiProcessId>,
+    ) -> Result<WasiProcess, ControlPlaneError> {
         if let Some(max) = self.state.config.max_task_count
             && self.active_task_count() >= max
         {
@@ -147,8 +177,135 @@ impl WasiControlPlane {
 
         let pid = mutable.next_process_id()?;
         proc.set_pid(pid);
+        let inherited = parent.and_then(|p| mutable.groups.get(&p).copied());
+        mutable.groups.insert(
+            pid,
+            ProcessGroupInfo {
+                parent,
+                group: inherited.map_or(pid.raw(), |g| g.group),
+                session: inherited.map_or(pid.raw(), |g| g.session),
+            },
+        );
+        mutable.foreground_group.get_or_insert(pid.raw());
         mutable.processes.insert(pid, proc.clone());
         Ok(proc)
+    }
+
+    pub fn process_group(&self, pid: WasiProcessId) -> Result<u32, Errno> {
+        let mut state = self.state.mutable.write().unwrap();
+        state.groups_enabled = true;
+        state.groups.get(&pid).map(|g| g.group).ok_or(Errno::Srch)
+    }
+
+    pub fn set_process_group(
+        &self,
+        caller: WasiProcessId,
+        pid: WasiProcessId,
+        group: u32,
+    ) -> Result<(), Errno> {
+        let mut state = self.state.mutable.write().unwrap();
+        let source = *state.groups.get(&caller).ok_or(Errno::Srch)?;
+        let target = *state.groups.get(&pid).ok_or(Errno::Srch)?;
+        if caller != pid && target.parent != Some(caller) {
+            return Err(Errno::Srch);
+        }
+        if source.session != target.session
+            || (pid.raw() == target.session && group != target.group)
+        {
+            return Err(Errno::Perm);
+        }
+        if group != pid.raw()
+            && !state
+                .groups
+                .values()
+                .any(|g| g.group == group && g.session == target.session)
+        {
+            return Err(Errno::Perm);
+        }
+        state.groups.get_mut(&pid).unwrap().group = group;
+        state.groups_enabled = true;
+        Ok(())
+    }
+
+    pub fn foreground_group(&self) -> Result<u32, Errno> {
+        self.state
+            .mutable
+            .read()
+            .unwrap()
+            .foreground_group
+            .ok_or(Errno::Notty)
+    }
+
+    pub fn set_foreground_group(&self, caller: WasiProcessId, group: u32) -> Result<(), Errno> {
+        let mut state = self.state.mutable.write().unwrap();
+        let session = state.groups.get(&caller).ok_or(Errno::Srch)?.session;
+        if !state
+            .groups
+            .values()
+            .any(|g| g.group == group && g.session == session)
+        {
+            return Err(Errno::Perm);
+        }
+        state.foreground_group = Some(group);
+        state.groups_enabled = true;
+        Ok(())
+    }
+
+    pub fn signal_process_target(
+        &self,
+        caller: WasiProcessId,
+        target: i32,
+        signal: Signal,
+    ) -> Result<(), Errno> {
+        let targets = {
+            let state = self.state.mutable.read().unwrap();
+            if target == -1 || target == i32::MIN {
+                return Err(Errno::Notsup);
+            }
+            let group = if target == 0 {
+                Some(state.groups.get(&caller).ok_or(Errno::Srch)?.group)
+            } else if target < -1 {
+                Some((-target) as u32)
+            } else {
+                None
+            };
+            state
+                .processes
+                .iter()
+                .filter(|(pid, process)| {
+                    process.try_join().is_none()
+                        && match group {
+                            Some(group) => state.groups.get(pid).is_some_and(|g| g.group == group),
+                            None => pid.raw() == target as u32,
+                        }
+                })
+                .map(|(_, process)| process.clone())
+                .collect::<Vec<_>>()
+        };
+        if targets.is_empty() {
+            return Err(Errno::Srch);
+        }
+        for process in targets {
+            // A group signal targets group members, never their unrelated children.
+            if signal != Signal::Signone {
+                process.signal_process_only(signal);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn signal_foreground(&self, signal: Signal) -> bool {
+        let group = {
+            let state = self.state.mutable.read().unwrap();
+            if !state.groups_enabled {
+                return false;
+            }
+            state.foreground_group
+        };
+        if let Some(group) = group {
+            let _ = self.signal_process_target(0u32.into(), -(group as i32), signal);
+        }
+        true
     }
 
     /// Generates a new process ID
@@ -216,6 +373,112 @@ mod tests {
     use crate::os::task::thread::WasiMemoryLayout;
 
     use super::*;
+
+    #[test]
+    fn test_process_groups_inherit_and_signal_only_members() {
+        let plane = WasiControlPlane::default();
+        let root = plane.new_process(ModuleHash::random()).unwrap();
+        let first = plane
+            .new_child_process(ModuleHash::random(), root.pid())
+            .unwrap();
+        let other = plane
+            .new_child_process(ModuleHash::random(), root.pid())
+            .unwrap();
+        assert_eq!(plane.process_group(first.pid()).unwrap(), root.pid().raw());
+        plane
+            .set_process_group(root.pid(), first.pid(), first.pid().raw())
+            .unwrap();
+        let descendant = plane
+            .new_child_process(ModuleHash::random(), first.pid())
+            .unwrap();
+        assert_eq!(
+            plane.process_group(descendant.pid()).unwrap(),
+            first.pid().raw()
+        );
+        let first_thread = first
+            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
+            .unwrap();
+        let descendant_thread = descendant
+            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
+            .unwrap();
+        let other_thread = other
+            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
+            .unwrap();
+        plane
+            .signal_process_target(root.pid(), -(first.pid().raw() as i32), Signal::Sigterm)
+            .unwrap();
+        assert_eq!(
+            first_thread.as_thread().pop_signals(),
+            vec![Signal::Sigterm]
+        );
+        assert_eq!(
+            descendant_thread.as_thread().pop_signals(),
+            vec![Signal::Sigterm]
+        );
+        assert!(other_thread.as_thread().pop_signals().is_empty());
+    }
+
+    #[test]
+    fn test_foreground_signal_excludes_background_and_shell() {
+        let plane = WasiControlPlane::default();
+        let shell = plane.new_process(ModuleHash::random()).unwrap();
+        let foreground = plane
+            .new_child_process(ModuleHash::random(), shell.pid())
+            .unwrap();
+        let background = plane
+            .new_child_process(ModuleHash::random(), shell.pid())
+            .unwrap();
+        plane
+            .set_process_group(shell.pid(), foreground.pid(), foreground.pid().raw())
+            .unwrap();
+        plane
+            .set_process_group(shell.pid(), background.pid(), background.pid().raw())
+            .unwrap();
+        let a = foreground
+            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
+            .unwrap();
+        let b = background
+            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
+            .unwrap();
+        let s = shell
+            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
+            .unwrap();
+        plane
+            .set_foreground_group(shell.pid(), foreground.pid().raw())
+            .unwrap();
+        assert!(plane.signal_foreground(Signal::Sigint));
+        assert_eq!(a.as_thread().pop_signals(), vec![Signal::Sigint]);
+        assert!(b.as_thread().pop_signals().is_empty());
+        assert!(s.as_thread().pop_signals().is_empty());
+    }
+
+    #[test]
+    fn test_group_assignment_and_missing_targets_are_rejected() {
+        let plane = WasiControlPlane::default();
+        let shell = plane.new_process(ModuleHash::random()).unwrap();
+        let a = plane
+            .new_child_process(ModuleHash::random(), shell.pid())
+            .unwrap();
+        let b = plane
+            .new_child_process(ModuleHash::random(), shell.pid())
+            .unwrap();
+        assert_eq!(
+            plane.set_process_group(a.pid(), b.pid(), b.pid().raw()),
+            Err(Errno::Srch)
+        );
+        assert_eq!(
+            plane.set_process_group(a.pid(), a.pid(), 99999),
+            Err(Errno::Perm)
+        );
+        assert_eq!(
+            plane.signal_process_target(shell.pid(), -99999, Signal::Sigterm),
+            Err(Errno::Srch)
+        );
+        assert_eq!(
+            plane.signal_process_target(shell.pid(), i32::MIN, Signal::Sigterm),
+            Err(Errno::Notsup)
+        );
+    }
 
     /// Simple test to ensure task limits are respected.
     #[test]

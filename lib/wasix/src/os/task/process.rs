@@ -451,11 +451,19 @@ impl WasiProcess {
         ));
 
         #[derive(Debug)]
-        struct SignalHandler(LockableWasiProcessInner);
+        struct SignalHandler(LockableWasiProcessInner, WasiControlPlaneHandle);
         impl SignalHandlerAbi for SignalHandler {
             fn signal(&self, signal: u8) -> Result<(), SignalDeliveryError> {
                 if let Ok(signal) = signal.try_into() {
-                    signal_process_internal(&self.0, signal);
+                    if signal == Signal::Sigint
+                        && self
+                            .1
+                            .upgrade()
+                            .is_some_and(|p| p.signal_foreground(signal))
+                    {
+                        return Ok(());
+                    }
+                    signal_process_internal(&self.0, signal, true);
                     Ok(())
                 } else {
                     Err(SignalDeliveryError)
@@ -467,11 +475,11 @@ impl WasiProcess {
             pid,
             module_hash,
             parent: None,
-            compute: plane,
+            compute: plane.clone(),
             inner: inner.clone(),
             finished: Arc::new(
                 OwnedTaskStatus::new(TaskStatus::Pending)
-                    .with_signal_handler(Arc::new(SignalHandler(inner))),
+                    .with_signal_handler(Arc::new(SignalHandler(inner, plane))),
             ),
             waiting,
             cpu_run_tokens: Arc::new(AtomicU32::new(0)),
@@ -614,7 +622,11 @@ impl WasiProcess {
 
     /// Signals all the threads in this process
     pub fn signal_process(&self, signal: Signal) {
-        signal_process_internal(&self.inner, signal);
+        signal_process_internal(&self.inner, signal, true);
+    }
+
+    pub fn signal_process_only(&self, signal: Signal) {
+        signal_process_internal(&self.inner, signal, false);
     }
 
     /// Registers the shared memory used by this process.
@@ -871,7 +883,11 @@ impl WasiProcess {
 }
 
 /// Signals all the threads in this process
-fn signal_process_internal(process: &LockableWasiProcessInner, signal: Signal) {
+fn signal_process_internal(
+    process: &LockableWasiProcessInner,
+    signal: Signal,
+    forward_children: bool,
+) {
     #[allow(unused_mut)]
     let mut guard = process.0.lock().unwrap();
     let pid = guard.pid;
@@ -901,7 +917,7 @@ fn signal_process_internal(process: &LockableWasiProcessInner, signal: Signal) {
 
     // Check if there are subprocesses that will receive this signal
     // instead of this process
-    if guard.waiting.load(Ordering::Acquire) > 0 {
+    if forward_children && guard.waiting.load(Ordering::Acquire) > 0 {
         let mut triggered = false;
         for child in guard.children.iter() {
             child.signal_process(signal);

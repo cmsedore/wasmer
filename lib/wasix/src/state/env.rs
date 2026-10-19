@@ -254,7 +254,9 @@ impl WasiEnv {
 
     /// Forking the WasiState is used when either fork or vfork is called
     pub fn fork(&self) -> Result<(Self, WasiThreadHandle), ControlPlaneError> {
-        let process = self.control_plane.new_process(self.process.module_hash)?;
+        let process = self
+            .control_plane
+            .new_child_process(self.process.module_hash, self.process.pid())?;
         let handle = process.new_thread(self.layout.clone(), ThreadStartType::MainThread)?;
 
         let thread = handle.as_thread();
