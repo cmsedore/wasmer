@@ -20,6 +20,7 @@ struct ActiveStore {
 #[derive(Default)]
 struct State {
     cancelled: bool,
+    cancel_code: Option<ExitCode>,
     cancelled_at: Option<Instant>,
     acknowledged: bool,
     next: u64,
@@ -89,6 +90,14 @@ impl ProcessExecution {
         self.state.lock().unwrap().cancelled
     }
 
+    pub(crate) fn cancellation_code(&self) -> ExitCode {
+        self.state
+            .lock()
+            .unwrap()
+            .cancel_code
+            .unwrap_or(137i32.into())
+    }
+
     pub(crate) fn enter(self: &Arc<Self>, interrupter: Interrupter) -> Option<ExecutionGuard> {
         let mut state = self.state.lock().unwrap();
         while state.stopped.is_some() && !state.cancelled {
@@ -139,7 +148,7 @@ impl ProcessExecution {
             state.async_waiters.push(cx.waker().clone());
         }
         if state.cancelled {
-            return Poll::Ready(Err(137i32.into()));
+            return Poll::Ready(Err(state.cancel_code.unwrap_or(137i32.into())));
         }
         if state.stopped.is_none() {
             return Poll::Ready(Ok(()));
@@ -177,7 +186,7 @@ impl ProcessExecution {
 
     fn finish_cancelled(&self) {
         if let Some(finished) = &self.finished {
-            finished.set_finished(Ok(ExitCode::from(137)));
+            finished.set_finished(Ok(self.cancellation_code()));
         }
         if let Some(plane) = self.control_plane.as_ref().and_then(|p| p.upgrade()) {
             plane.notify_parent_child_event(self.pid);
@@ -185,12 +194,17 @@ impl ProcessExecution {
     }
 
     pub(crate) fn cancel(self: &Arc<Self>) {
+        self.cancel_with_code(137i32.into());
+    }
+
+    pub(crate) fn cancel_with_code(self: &Arc<Self>, code: ExitCode) {
         let (acknowledged, waiters) = {
             let mut state = self.state.lock().unwrap();
             if state.cancelled {
                 return;
             }
             state.cancelled = true;
+            state.cancel_code = Some(code);
             state.stopped = None;
             state.parked.clear();
             self.resumed.notify_all();
@@ -382,7 +396,7 @@ impl ExecutionGuard {
     ) -> Result<Option<T>, ExitCode> {
         let state = self.execution.state.lock().unwrap();
         if state.cancelled {
-            return Err(137i32.into());
+            return Err(state.cancel_code.unwrap_or(137i32.into()));
         }
         if state.stopped.is_some() {
             return Ok(None);
@@ -485,6 +499,30 @@ mod tests {
         drop(second);
         assert!(!process.is_active());
         assert!(process.state.lock().unwrap().acknowledged);
+    }
+
+    #[test]
+    fn signal_cancellation_preserves_reason_until_every_worker_returns() {
+        let finished = Arc::new(OwnedTaskStatus::new(
+            super::super::task_join_handle::TaskStatus::Running,
+        ));
+        let mut execution = ProcessExecution::new(10u32.into());
+        execution.finished = Some(finished.clone());
+        let process = Arc::new(execution);
+        let first = process.enter_async().unwrap();
+        let second = process.enter_async().unwrap();
+        process.cancel_with_code(141i32.into());
+        process.cancel();
+        assert_eq!(process.cancellation_code(), 141i32.into());
+        assert!(finished.status().is_running());
+        assert_eq!(first.commit_if_permitted(|| 1), Err(141i32.into()));
+        drop(first);
+        assert!(finished.status().is_running());
+        drop(second);
+        assert_eq!(
+            finished.status().into_finished().unwrap().unwrap(),
+            141i32.into()
+        );
     }
 
     #[test]

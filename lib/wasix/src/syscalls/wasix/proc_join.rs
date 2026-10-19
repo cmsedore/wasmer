@@ -11,6 +11,7 @@ use crate::{WasiProcess, syscalls::*};
 enum JoinStatusResult {
     Nothing,
     ExitNormal(WasiProcessId, ExitCode),
+    ExitSignal(WasiProcessId, Signal),
     Stopped(WasiProcessId, Signal),
     Err(Errno),
 }
@@ -27,22 +28,22 @@ async fn wait_child_event(process: WasiProcess, wake_stopped: bool) -> JoinStatu
         .await
         {
             Either::Left((status, _)) => {
-                JoinStatusResult::ExitNormal(pid, status.unwrap_or_else(|_| Errno::Child.into()))
+                finished_child_event(&process, status.unwrap_or_else(|_| Errno::Child.into()))
             }
             Either::Right((signal, _)) => JoinStatusResult::Stopped(pid, signal),
         };
     }
     let _ = wake_stopped;
-    JoinStatusResult::ExitNormal(
-        pid,
+    finished_child_event(
+        &process,
         process.join().await.unwrap_or_else(|_| Errno::Child.into()),
     )
 }
 
 fn ready_child_event(process: &WasiProcess, wake_stopped: bool) -> Option<JoinStatusResult> {
     if let Some(status) = process.try_join() {
-        return Some(JoinStatusResult::ExitNormal(
-            process.pid(),
+        return Some(finished_child_event(
+            process,
             status.unwrap_or_else(|_| Errno::Child.into()),
         ));
     }
@@ -56,8 +57,15 @@ fn ready_child_event(process: &WasiProcess, wake_stopped: bool) -> Option<JoinSt
     None
 }
 
+fn finished_child_event(process: &WasiProcess, status: ExitCode) -> JoinStatusResult {
+    match process.termination_signal() {
+        Some(signal) => JoinStatusResult::ExitSignal(process.pid(), signal),
+        None => JoinStatusResult::ExitNormal(process.pid(), status),
+    }
+}
+
 fn finish_child_event(parent: &WasiProcess, result: JoinStatusResult) -> JoinStatusResult {
-    if let JoinStatusResult::ExitNormal(pid, _) = result {
+    if let JoinStatusResult::ExitNormal(pid, _) | JoinStatusResult::ExitSignal(pid, _) = result {
         parent
             .inner
             .0
@@ -118,6 +126,26 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
                         tag: JoinStatusType::ExitNormal,
                         u: JoinStatusUnion {
                             exit_normal: exit_code.raw() as u16,
+                        },
+                    }
+                }
+                JoinStatusResult::ExitSignal(pid, signal) => {
+                    pid_ptr
+                        .write(
+                            &view,
+                            OptionPid {
+                                tag: OptionTag::Some,
+                                pid: pid.raw() as Pid,
+                            },
+                        )
+                        .ok();
+                    JoinStatus {
+                        tag: JoinStatusType::ExitSignal,
+                        u: JoinStatusUnion {
+                            exit_signal: wasmer_wasix_types::wasi::ErrnoSignal {
+                                signal,
+                                exit_code: Errno::Success,
+                            },
                         },
                     }
                 }

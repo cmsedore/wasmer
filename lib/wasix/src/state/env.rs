@@ -655,15 +655,20 @@ impl WasiEnv {
 
     /// Detach a read into an owned buffer; no guest-memory borrow crosses await.
     /// The returned future owns only a cloned, rights-checked pipe endpoint.
-    pub fn owned_pipe_read(&self, fd: u32, capacity: usize)
-        -> Result<BoxFuture<'static, Result<Vec<u8>, Errno>>, Errno> {
+    pub fn owned_pipe_read(
+        &self,
+        fd: u32,
+        capacity: usize,
+    ) -> Result<BoxFuture<'static, Result<Vec<u8>, Errno>>, Errno> {
         use crate::fs::Kind;
         use wasmer_wasix_types::wasi::{Fdflags, Rights};
         let entry = self.state.fs.get_fd(fd)?;
         if !entry.is_stdio && !entry.inner.rights.contains(Rights::FD_READ) {
             return Err(Errno::Access);
         }
-        if capacity > 1024 * 1024 { return Err(Errno::Inval); }
+        if capacity > 1024 * 1024 {
+            return Err(Errno::Inval);
+        }
         let nonblocking = entry.inner.flags.contains(Fdflags::NONBLOCK);
         let mut rx = match &*entry.inode.read() {
             Kind::PipeRx { rx } => rx.clone(),
@@ -671,7 +676,9 @@ impl WasiEnv {
         };
         Ok(Box::pin(async move {
             let mut bytes = vec![0; capacity];
-            let read = if capacity == 0 { 0 } else if nonblocking {
+            let read = if capacity == 0 {
+                0
+            } else if nonblocking {
                 rx.try_read(&mut bytes).ok_or(Errno::Again)?
             } else {
                 virtual_fs::AsyncReadExt::read(&mut rx, &mut bytes).await?
@@ -758,11 +765,12 @@ impl WasiEnv {
                         || sig == Signal::Sigabrt
                         || sig == Signal::Sigpipe
                     {
-                        let exit_code = if env.runtime().signal_safepoints() {
-                            ExitCode::from(128 + sig as i32)
-                        } else {
-                            env.thread.set_or_get_exit_code_for_signal(sig)
-                        };
+                        let exit_code =
+                            if env.runtime().signal_safepoints() || sig == Signal::Sigpipe {
+                                ExitCode::from(128 + sig as i32)
+                            } else {
+                                env.thread.set_or_get_exit_code_for_signal(sig)
+                            };
                         return Err(WasiError::Exit(exit_code));
                     } else {
                         tracing::trace!(pid=%env.pid(), ?sig, "Signal ignored");
@@ -904,6 +912,13 @@ impl WasiEnv {
 
     /// Returns an exit code if the thread or process has been forced to exit
     pub fn should_exit(&self) -> Option<ExitCode> {
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        {
+            let execution = self.process.inner.0.lock().unwrap().execution.clone();
+            if execution.is_cancelled() {
+                return Some(execution.cancellation_code());
+            }
+        }
         // Check for forced exit
         if let Some(forced_exit) = self.thread.try_join() {
             return Some(forced_exit.unwrap_or_else(|err| {

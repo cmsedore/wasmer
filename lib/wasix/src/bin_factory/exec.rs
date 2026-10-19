@@ -135,7 +135,7 @@ pub fn spawn_exec_module(
     let pid = env.pid();
 
     let join_handle = env.thread.join_handle();
-    if runtime.signal_safepoints() {
+    {
         // Callback registration belongs to an executable image. An exec from
         // Bash into a WASIp1 program must not inherit Bash's registration flag.
         env.state
@@ -215,8 +215,9 @@ pub fn run_exec(props: TaskWasmRunProperties) {
         match execution.enter(store.interrupter()) {
             Some(guard) => guard,
             None => {
-                thread.thread.set_status_finished(Ok(137i32.into()));
-                ctx.data(&store).blocking_on_exit(Some(137i32.into()));
+                let code = execution.cancellation_code();
+                thread.thread.set_status_finished(Ok(code));
+                ctx.data(&store).blocking_on_exit(Some(code));
                 unsafe { run_recycle(recycle, ctx, store) };
                 return;
             }
@@ -360,20 +361,23 @@ fn call_module(
         };
     };
 
-    // SIGKILL can win through a native interrupt, a queued guest signal, or
-    // disabled shared-memory atomics. All are cancellation of this process.
+    // Native interrupt, queued signal and disabled atomics share one result.
     #[cfg(all(unix, feature = "experimental-host-interrupt"))]
-    if ctx
-        .data(&store)
-        .process
-        .inner
-        .0
-        .lock()
-        .unwrap()
-        .execution
-        .is_cancelled()
     {
-        call_ret = Err(RuntimeError::user(Box::new(WasiError::Exit(137i32.into()))));
+        let execution = ctx
+            .data(&store)
+            .process
+            .inner
+            .0
+            .lock()
+            .unwrap()
+            .execution
+            .clone();
+        if execution.is_cancelled() {
+            call_ret = Err(RuntimeError::user(Box::new(WasiError::Exit(
+                execution.cancellation_code(),
+            ))));
+        }
     }
 
     let ret = if let Err(err) = call_ret {

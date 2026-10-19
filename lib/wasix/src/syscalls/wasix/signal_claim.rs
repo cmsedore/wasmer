@@ -18,3 +18,13 @@ pub fn verkosto_signal_pending_v1(ctx: FunctionEnvMut<'_, WasiEnv>) -> u64 {
 pub fn verkosto_signal_delivered_v1(ctx: FunctionEnvMut<'_, WasiEnv>, restart: i32) {
     ctx.data().thread.record_signal_handler(restart != 0);
 }
+
+/// Private libc default-action ABI. A signal exit is distinct from _Exit(141).
+pub fn verkosto_signal_terminate_v1(
+    ctx: FunctionEnvMut<'_, WasiEnv>,
+    signal: Signal,
+) -> Result<(), WasiError> {
+    Err(WasiError::Exit(
+        ctx.data().process.terminate_for_signal(signal),
+    ))
+}

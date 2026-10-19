@@ -50,12 +50,16 @@ pub struct AsyncExecution(super::execution::ExecutionGuard);
 impl AsyncExecution {
     /// Commit a bounded host-memory operation atomically with respect to stop/kill.
     /// The closure must not block, await, or call guest code.
-    pub fn commit_if_permitted<T>(&self, commit: impl FnOnce() -> T)
-        -> Result<Option<T>, ExitCode> {
+    pub fn commit_if_permitted<T>(
+        &self,
+        commit: impl FnOnce() -> T,
+    ) -> Result<Option<T>, ExitCode> {
         self.0.commit_if_permitted(commit)
     }
-    pub fn poll_permitted(&self, cx: &mut std::task::Context<'_>)
-        -> std::task::Poll<Result<(), ExitCode>> {
+    pub fn poll_permitted(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ExitCode>> {
         self.0.poll_permitted(cx)
     }
 }
@@ -63,7 +67,13 @@ impl AsyncExecution {
 #[cfg(all(unix, feature = "experimental-host-interrupt"))]
 impl WasiProcess {
     pub fn begin_async_execution(&self) -> Option<AsyncExecution> {
-        self.inner.0.lock().unwrap().execution.enter_async().map(AsyncExecution)
+        self.inner
+            .0
+            .lock()
+            .unwrap()
+            .execution
+            .enter_async()
+            .map(AsyncExecution)
     }
 }
 
@@ -189,6 +199,7 @@ pub struct WasiProcessInner {
     /// Signals that will be triggered at specific intervals
     pub signal_intervals: HashMap<Signal, WasiSignalInterval>,
     pub(crate) process_signals: super::signal::ProcessSignalQueue,
+    termination_signal: Option<Signal>,
     /// List of all the children spawned from this thread
     pub children: Vec<WasiProcess>,
     /// Represents a checkpoint which blocks all the threads
@@ -462,6 +473,7 @@ impl WasiProcess {
                 thread_count: Default::default(),
                 signal_intervals: Default::default(),
                 process_signals: Default::default(),
+                termination_signal: None,
                 children: Default::default(),
                 checkpoint: WasiProcessCheckpoint::Execute,
                 wakers: Default::default(),
@@ -958,6 +970,33 @@ impl WasiProcess {
         Ok(Some((child.pid, code)))
     }
 
+    pub(crate) fn termination_signal(&self) -> Option<Signal> {
+        self.inner.0.lock().unwrap().termination_signal
+    }
+
+    /// Stop native execution before publishing signal termination to waiters.
+    pub(crate) fn terminate_for_signal(&self, signal: Signal) -> ExitCode {
+        let code = ExitCode::from(128 + signal as i32);
+        let mut inner = self.inner.0.lock().unwrap();
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        let code = {
+            inner.execution.cancel_with_code(code);
+            let selected = inner.execution.cancellation_code();
+            if selected == code {
+                inner.termination_signal.get_or_insert(signal);
+            }
+            selected
+        };
+        #[cfg(not(all(unix, feature = "experimental-host-interrupt")))]
+        {
+            inner.termination_signal.get_or_insert(signal);
+        }
+        for thread in inner.threads.values() {
+            thread.signal(Signal::Sigwakeup);
+        }
+        code
+    }
+
     /// Terminate the process and all its threads
     pub fn terminate(&self, exit_code: ExitCode) {
         let pid = self.pid;
@@ -969,7 +1008,7 @@ impl WasiProcess {
         let cancelled = guard.execution.is_cancelled();
         #[cfg(all(unix, feature = "experimental-host-interrupt"))]
         let exit_code = if cancelled {
-            ExitCode::from(137)
+            guard.execution.cancellation_code()
         } else {
             exit_code
         };

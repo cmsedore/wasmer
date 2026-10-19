@@ -177,6 +177,35 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
     should_update_cursor: bool,
     should_snapshot: bool,
 ) -> Result<Result<usize, Errno>, WasiError> {
+    let result = fd_write_impl::<M>(
+        ctx,
+        fd,
+        fd_entry,
+        data,
+        offset,
+        should_update_cursor,
+        should_snapshot,
+    )?;
+    if matches!(result, Err(Errno::Pipe)) {
+        // A failed write targets its calling thread, never another eligible
+        // thread or a waiting child. Release inode/store-memory borrows before
+        // invoking guest handlers: a handler may write this same fd again.
+        ctx.data().thread.signal(Signal::Sigpipe);
+        wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
+    }
+    Ok(result)
+}
+
+#[allow(clippy::await_holding_lock)]
+fn fd_write_impl<M: MemorySize>(
+    mut ctx: &mut FunctionEnvMut<'_, WasiEnv>,
+    fd: WasiFd,
+    fd_entry: Fd,
+    data: FdWriteSource<'_, M>,
+    offset: u64,
+    should_update_cursor: bool,
+    should_snapshot: bool,
+) -> Result<Result<usize, Errno>, WasiError> {
     let mut offset = offset;
     let mut env = ctx.data();
     let state = env.state.clone();
@@ -236,6 +265,9 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                                 .map_err(mem_error_to_wasi)?
                                                 .access()
                                                 .map_err(mem_error_to_wasi)?;
+                                            if buf.is_empty() {
+                                                continue;
+                                            }
                                             let local_written =
                                                 match handle.write(buf.as_ref()).await {
                                                     Ok(s) => s,
@@ -356,6 +388,9 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                         .map_err(mem_error_to_wasi)
                                 );
                                 let buf = wasi_try_ok_ok!(buf.access().map_err(mem_error_to_wasi));
+                                if buf.is_empty() {
+                                    continue;
+                                }
                                 let write_result = std::io::Write::write(tx, buf.as_ref());
                                 let local_written = match write_result {
                                     Ok(w) => w,
@@ -376,8 +411,6 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                             drop(iovs_arr);
 
                             if raise_sigpipe {
-                                env.process.signal_process(Signal::Sigpipe);
-                                wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
                                 return Ok(Err(Errno::Pipe));
                             }
                         }
@@ -385,8 +418,6 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                             match std::io::Write::write_all(tx, data) {
                                 Ok(()) => (),
                                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                                    env.process.signal_process(Signal::Sigpipe);
-                                    wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
                                     return Ok(Err(Errno::Pipe));
                                 }
                                 Err(e) => return Ok(Err(map_io_err(e))),
@@ -415,6 +446,9 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                         .map_err(mem_error_to_wasi)
                                 );
                                 let buf = wasi_try_ok_ok!(buf.access().map_err(mem_error_to_wasi));
+                                if buf.is_empty() {
+                                    continue;
+                                }
                                 let write_result = std::io::Write::write(pipe, buf.as_ref());
                                 let local_written = match write_result {
                                     Ok(w) => w,
@@ -435,8 +469,6 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                             drop(iovs_arr);
 
                             if raise_sigpipe {
-                                env.process.signal_process(Signal::Sigpipe);
-                                wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
                                 return Ok(Err(Errno::Pipe));
                             }
                         }
@@ -444,8 +476,6 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                             match std::io::Write::write_all(pipe, data) {
                                 Ok(()) => (),
                                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                                    env.process.signal_process(Signal::Sigpipe);
-                                    wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
                                     return Ok(Err(Errno::Pipe));
                                 }
                                 Err(e) => return Ok(Err(map_io_err(e))),
