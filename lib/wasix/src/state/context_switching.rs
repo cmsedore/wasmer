@@ -112,6 +112,24 @@ impl ContextSwitchingEnvironment {
         entrypoint: wasmer::Function,
         params: Vec<wasmer::Value>,
     ) -> (Store, Result<Box<[wasmer::Value]>, RuntimeError>) {
+        // Keep this guard on the native stack until all main-context execution
+        // has returned. Guest TaskStatus::Finished is not this acknowledgement.
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        let _execution = {
+            let process = &ctx.data(&store).process;
+            let execution = process.inner.0.lock().unwrap().execution.clone();
+            match execution.enter(store.interrupter()) {
+                Some(guard) => guard,
+                None => {
+                    return (
+                        store,
+                        Err(RuntimeError::user(
+                            WasiError::Exit(ExitCode::from(137)).into(),
+                        )),
+                    );
+                }
+            }
+        };
         if !ctx
             .data(&store)
             .capabilities

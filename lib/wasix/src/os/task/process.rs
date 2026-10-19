@@ -183,6 +183,8 @@ pub struct WasiProcessInner {
     pub cleanup_started: bool,
     /// Shared process memory.
     pub memory: Option<MemoryOps>,
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    pub(crate) execution: Arc<super::execution::ProcessExecution>,
     /// The snapshot memory significantly reduce the amount of
     /// duplicate entries in the journal for memory that has not changed
     #[cfg(feature = "journal")]
@@ -438,6 +440,8 @@ impl WasiProcess {
                 wakers: Default::default(),
                 cleanup_started: false,
                 memory: Default::default(),
+                #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+                execution: Arc::new(super::execution::ProcessExecution::new(pid)),
                 waiting: waiting.clone(),
                 #[cfg(feature = "journal")]
                 snapshot_on: Default::default(),
@@ -500,6 +504,12 @@ impl WasiProcess {
 
     pub(super) fn set_pid(&mut self, pid: WasiProcessId) {
         self.pid = pid;
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        {
+            // Control-plane allocation assigns the PID before any Store runs.
+            self.inner.0.lock().unwrap().execution =
+                Arc::new(super::execution::ProcessExecution::new(pid));
+        }
     }
 
     /// Gets the process ID of this process
@@ -623,6 +633,16 @@ impl WasiProcess {
     /// Signals all the threads in this process
     pub fn signal_process(&self, signal: Signal) {
         signal_process_internal(&self.inner, signal, true);
+    }
+
+    /// Includes native execution that has not acknowledged a logical exit yet.
+    pub fn has_active_execution(&self) -> bool {
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        {
+            return self.inner.0.lock().unwrap().execution.is_active();
+        }
+        #[cfg(not(all(unix, feature = "experimental-host-interrupt")))]
+        false
     }
 
     pub fn signal_process_only(&self, signal: Signal) {
@@ -926,6 +946,13 @@ fn signal_process_internal(
         if triggered {
             return;
         }
+    }
+
+    // SIGKILL cannot depend on the guest reaching another syscall. Request a
+    // per-process Store trap, including every currently active guest thread.
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    if signal == Signal::Sigkill {
+        guard.execution.cancel();
     }
 
     // Otherwise just send the signal to all the threads

@@ -188,6 +188,28 @@ pub fn run_exec(props: TaskWasmRunProperties) {
     let thread = WasiThreadRunGuard::new(ctx.data(&store).thread.clone());
     let recycle = props.recycle;
 
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    let _execution = {
+        let execution = ctx
+            .data(&store)
+            .process
+            .inner
+            .0
+            .lock()
+            .unwrap()
+            .execution
+            .clone();
+        match execution.enter(store.interrupter()) {
+            Some(guard) => guard,
+            None => {
+                thread.thread.set_status_finished(Ok(137i32.into()));
+                ctx.data(&store).blocking_on_exit(Some(137i32.into()));
+                unsafe { run_recycle(recycle, ctx, store) };
+                return;
+            }
+        }
+    };
+
     // Perform the initialization
     // If this module exports an _initialize function, run that first.
     if let Ok(initialize) = ctx

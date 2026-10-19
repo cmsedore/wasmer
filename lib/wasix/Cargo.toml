@@ -214,6 +214,7 @@ default = ["sys-default"]
 
 time = ["tokio/time"]
 ctrlc = ["tokio/signal"]
+experimental-host-interrupt = ["wasmer/experimental-host-interrupt"]
 # the minimal sys implementation
 sys-minimal = ["wasmer/sys", "sys-thread", "tokio/fs"]
 sys = [

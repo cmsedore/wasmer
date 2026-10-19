@@ -2,6 +2,8 @@
 
 pub mod backoff;
 pub mod control_plane;
+#[cfg(all(unix, feature = "experimental-host-interrupt"))]
+pub(crate) mod execution;
 pub mod process;
 pub mod signal;
 mod task_join_handle;

@@ -73,6 +73,16 @@ impl WasiFunctionEnv {
 
         let mut store = store.unwrap_or_else(|| env.runtime().new_store());
 
+        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        let _execution = {
+            let execution = env.process.inner.0.lock().unwrap().execution.clone();
+            execution.enter(store.interrupter()).ok_or_else(|| {
+                WasiThreadError::InitFailed(std::sync::Arc::new(anyhow::anyhow!(
+                    "process cancelled"
+                )))
+            })?
+        };
+
         let (_, ctx) = env.instantiate(
             module,
             &mut store,

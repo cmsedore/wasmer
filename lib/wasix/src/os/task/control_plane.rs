@@ -273,7 +273,7 @@ impl WasiControlPlane {
                 .processes
                 .iter()
                 .filter(|(pid, process)| {
-                    process.try_join().is_none()
+                    (process.try_join().is_none() || process.has_active_execution())
                         && match group {
                             Some(group) => state.groups.get(pid).is_some_and(|g| g.group == group),
                             None => pid.raw() == target as u32,
@@ -373,6 +373,29 @@ mod tests {
     use crate::os::task::thread::WasiMemoryLayout;
 
     use super::*;
+
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    #[test]
+    fn test_finished_process_with_active_execution_can_still_be_killed() {
+        let plane = WasiControlPlane::default();
+        let process = plane.new_process(ModuleHash::random()).unwrap();
+        let execution = process.inner.0.lock().unwrap().execution.clone();
+        let store = wasmer::Store::default();
+        let guard = execution.enter(store.interrupter()).unwrap();
+        process.finished.set_finished(Ok(0i32.into()));
+        assert!(process.try_join().is_some());
+        assert!(process.has_active_execution());
+        plane
+            .signal_process_target(process.pid(), process.pid().raw() as i32, Signal::Sigkill)
+            .unwrap();
+        assert!(execution.enter(store.interrupter()).is_none());
+        drop(guard);
+        assert!(!process.has_active_execution());
+        assert_eq!(
+            plane.signal_process_target(process.pid(), process.pid().raw() as i32, Signal::Signone),
+            Err(Errno::Srch)
+        );
+    }
 
     #[test]
     fn test_process_groups_inherit_and_signal_only_members() {
