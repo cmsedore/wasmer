@@ -263,10 +263,12 @@ impl Cranelift {
             flags.enable("is_pic").expect("should be a valid flag");
         }
 
-        // These trampolines are always reachable through short jumps.
-        flags
-            .enable("use_colocated_libcalls")
-            .expect("should be a valid flag");
+        // Large AArch64 modules cannot assume nearby libcall trampolines.
+        if !matches!(target.triple().architecture, Architecture::Aarch64(_)) {
+            flags
+                .enable("use_colocated_libcalls")
+                .expect("should be a valid flag");
+        }
 
         if matches!(target.triple().operating_system, OperatingSystem::Windows) {
             // For macOS and Linux we rely on the precise `ReturnAbi` calling conventions.

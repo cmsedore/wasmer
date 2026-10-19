@@ -1689,7 +1689,8 @@ impl FuncEnvironment<'_> {
         Ok(func.import_function(ir::ExtFuncData {
             name,
             signature,
-            colocated: true,
+            // A module's native code can exceed AArch64's direct branch range.
+            colocated: !matches!(self.architecture, Architecture::Aarch64(_)),
             patchable: false,
         }))
     }
